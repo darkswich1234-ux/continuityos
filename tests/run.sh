@@ -221,6 +221,64 @@ command_checks() {
   "${envp[@]}" proton rm demo --yes >/dev/null 2>&1
   [ ! -e "$home/.local/share/universal-prefixes/demo" ] && pass "proton rm deletes the prefix" || fail "proton rm left the prefix behind"
 
+  group "proton · launchers"
+  # A fresh Proton prefix ships its own Internet Explorer, Media Player and
+  # WordPad, each duplicated under "Program Files" and "Program Files (x86)".
+  # Registering those buries the one application the user actually installed.
+  local lp="$home/.local/share/universal-prefixes/launchtest/drive_c"
+  mkdir -p "$lp/Program Files/Internet Explorer" \
+           "$lp/Program Files/Windows Media Player" \
+           "$lp/Program Files/Windows NT/Accessories" \
+           "$lp/Program Files/RealApp" \
+           "$lp/Program Files (x86)/RealApp"
+  : >"$lp/Program Files/Internet Explorer/iexplore.exe"
+  : >"$lp/Program Files/Windows Media Player/wmplayer.exe"
+  : >"$lp/Program Files/Windows NT/Accessories/wordpad.exe"
+  : >"$lp/Program Files/RealApp/Real App.exe"
+  : >"$lp/Program Files (x86)/RealApp/Real App.exe"
+  "${envp[@]}" proton launchers launchtest >/dev/null 2>&1
+  local ldir="$home/.local/share/applications/continuity/launchtest" found
+  found="$(find "$ldir" -name '*.desktop' -printf '%f\n' 2>/dev/null | sort | tr '\n' ' ')"
+  [ "$found" = "real-app.desktop " ] && \
+    pass "only the application the user installed gets a launcher" || \
+    fail "unexpected launchers: ${found:-none}"
+  grep -qx 'Name=Real App' "$ldir/real-app.desktop" 2>/dev/null && \
+    pass "the launcher is named after the application" || fail "the launcher has no Name"
+  # "Program Files" and "Program Files (x86)" both hold a copy; either is a
+  # valid target, so assert the prefix path rather than one exact copy.
+  if grep -q 'drive_c/Program Files' "$ldir/real-app.desktop" 2>/dev/null && \
+     grep -q 'RealApp/Real App.exe"' "$ldir/real-app.desktop" 2>/dev/null; then
+    pass "the launcher points at the executable inside the prefix"
+  else
+    fail "the launcher does not point into the prefix"
+  fi
+  out="$(find "$ldir" -name 'iexplore.desktop' -o -name 'wmplayer.desktop' -o -name 'wordpad.desktop' 2>/dev/null)"
+  [ -z "$out" ] && pass "the prefix's own accessories are ignored" || fail "a bundled accessory got a launcher"
+
+  group "proton · launching registers a native app"
+  # Writing the command reaches for umu-run, so a stub on PATH is enough to
+  # exercise the real launch path without a Proton install.
+  local fb="$t/fakebin" app="$t/Portable Game.exe" apps="$home/.local/share/applications/continuity"
+  mkdir -p "$fb"; : >"$app"
+  printf '#!/bin/sh\nexit 0\n' >"$fb/umu-run"; chmod +x "$fb/umu-run"
+  PATH="$fb:$home/.local/bin:$PATH" HOME="$home" "$home/.local/bin/proton" --name "Portable Game" "$app" >/dev/null 2>&1
+  [ -f "$apps/portable-game/portable-game.desktop" ] && \
+    pass "a launch adds an application-menu entry" || fail "a launch wrote no menu entry"
+  grep -q "\"$app\"" "$apps/portable-game/portable-game.desktop" 2>/dev/null && \
+    pass "the entry runs the program that was launched" || fail "the entry does not point at the program"
+  printf '#!/bin/sh\nexit 1\n' >"$fb/umu-run"
+  : >"$t/Crashy.exe"
+  PATH="$fb:$home/.local/bin:$PATH" HOME="$home" "$home/.local/bin/proton" --name "Crashy" "$t/Crashy.exe" >/dev/null 2>&1
+  [ -f "$apps/crashy/crashy.desktop" ] && \
+    pass "a non-zero exit still leaves the menu entry" || fail "a non-zero exit skipped the menu entry"
+  PATH="$fb:$home/.local/bin:$PATH" HOME="$home" "$home/.local/bin/proton" --no-launcher --name "NoEntry" "$app" >/dev/null 2>&1
+  [ ! -e "$apps/noentry" ] && pass "--no-launcher writes no entry" || fail "--no-launcher still wrote an entry"
+  PATH="$fb:$home/.local/bin:$PATH" HOME="$home" "$home/.local/bin/proton" --name "Setup" --installer "$app" >/dev/null 2>&1
+  [ ! -e "$apps/setup" ] && pass "an installer does not register itself" || fail "the installer got a menu entry"
+  : >"$t/unins000.exe"
+  PATH="$fb:$home/.local/bin:$PATH" HOME="$home" "$home/.local/bin/proton" --name "Uninstaller" "$t/unins000.exe" >/dev/null 2>&1
+  [ ! -e "$apps/uninstaller" ] && pass "an uninstaller does not get a menu entry" || fail "the uninstaller got a menu entry"
+
   group "proton · distribution-aware advice"
   out="$("${envp[@]}" proton check --fix 2>&1)"
   fam="$(CONTINUITY_LIB="$home/.local/lib/continuity/continuity-common.sh" bash -c '. "$CONTINUITY_LIB"; continuity_family')"

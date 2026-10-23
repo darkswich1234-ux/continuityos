@@ -6,6 +6,7 @@
 #   continuity-prefix path MyGame             print the prefix directory
 #   continuity-prefix scan MyGame             list .exe inside drive_c
 #   continuity-prefix launchers MyGame --auto register launchers for found .exe
+#   continuity-prefix register MyGame /path/app.exe   one launcher, any location
 #   continuity-prefix rm MyGame               complete, verifiable uninstall
 #   continuity-prefix export MyGame out.tar.zst
 #   continuity-prefix import out.tar.zst
@@ -64,6 +65,8 @@ COMMANDS
   scan <slug> [--all]            List launchable .exe in drive_c
   launchers <slug> [--auto] [--list] [--remove]
                                  Create/list/remove desktop launchers for a prefix
+  register <slug> <exe> [--name NAME]
+                                 One launcher for one program, inside the prefix or not
   rm <slug> [--yes]              Delete prefix and its launchers (full uninstall)
   export <slug> <file.tar.zst>   Archive a prefix (zstd when available)
   import <file[.tar.zst|.tar.gz]> <slug>
@@ -100,18 +103,7 @@ human_size() {
   if continuity_have du; then du -sh "$dir" 2>/dev/null | cut -f1; else printf '?'; fi
 }
 
-is_system_exe() {
-  # Executables that are part of the prefix plumbing, not user applications.
-  local rel="$1"
-  case "$rel" in
-    windows/*|*/windows/*) return 0 ;;
-    *"/Windows/"*|*"/windows/"*) return 0 ;;
-    *Microsoft.NET*|*Installer*|*WinMetadata*) return 0 ;;
-    */unins*.exe|*/Unins*.exe|*/uninstall*.exe) return 0 ;;
-    */rundll32.exe|*/msiexec.exe|*/regsvr32.exe|*/cmd.exe|*/explorer.exe) return 0 ;;
-    *) return 1 ;;
-  esac
-}
+is_system_exe() { continuity_is_system_exe "$1"; }
 
 prefix_drive_c() { continuity_prefix_drive_c "$1"; }
 
@@ -159,11 +151,10 @@ exe_icon() {
 }
 
 write_launcher() {
-  local slug="$1" rel_exe="$2" name="$3" icon="$4"
-  local prefix drive exe exe_abs launcher_dir launcher_file
-  prefix="$(continuity_prefix_dir "$slug")"
-  drive="$(prefix_drive_c "$slug")"
-  exe_abs="$drive/$rel_exe"
+  # exe_abs is the file the launcher runs; rel_exe is how it is named inside the
+  # prefix (or the absolute path, for a program that lives outside its prefix).
+  local slug="$1" exe_abs="$2" name="$3" icon="$4" rel_exe="${5:-$2}"
+  local launcher_dir launcher_file
   [ -f "$exe_abs" ] || return 1
   launcher_dir="$CONTINUITY_LAUNCHER_DIR/$slug"
   mkdir -p "$launcher_dir"
@@ -285,10 +276,20 @@ case "$CMD" in
         ;;
       auto)
         count=0
+        # Two executables with the same file name (Proton keeps a copy under
+        # both "Program Files" and "Program Files (x86)") map to the same
+        # launcher path, so the second would silently overwrite the first and
+        # still be counted. Keep the first and say the rest were skipped.
+        declare -A seen_names=()
         icon_root="$CONTINUITY_STATE_DIR/icons/$slug"
         while IFS= read -r rel; do
           [ -n "$rel" ] || continue
           base="${rel##*/}"; stem="${base%.*}"
+          name_slug="$(continuity_slugify "$stem")"
+          if [ -n "${seen_names[$name_slug]:-}" ]; then
+            continuity_warn "skipped '$rel': '$stem' already has a launcher"
+            continue
+          fi
           # A themed icon always exists; the shipped SVG is only used when this
           # project installed its assets (a bare engine install does not).
           icon="application-x-executable"
@@ -298,7 +299,8 @@ case "$CMD" in
           if extracted="$(exe_icon "$(prefix_drive_c "$slug")/$rel" "$(continuity_slugify "$stem")" "$icon_root" 2>/dev/null)"; then
             icon="$extracted"
           fi
-          if out="$(write_launcher "$slug" "$rel" "$stem" "$icon")"; then
+          if out="$(write_launcher "$slug" "$(prefix_drive_c "$slug")/$rel" "$stem" "$icon" "$rel")"; then
+            seen_names[$name_slug]=1
             count=$((count+1))
             [ "${CONTINUITY_QUIET:-0}" = "1" ] || printf 'launcher: %s -> %s\n' "$stem" "$out"
           fi
@@ -311,6 +313,43 @@ case "$CMD" in
         fi
         ;;
     esac
+    ;;
+
+  register)
+    # One explicit program -> one launcher, whether the executable lives inside
+    # the prefix (installed apps) or outside it (portable games). continuity-run
+    # calls this after a launch, so running a program is enough to get an entry.
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix register <slug> <exe> [--name NAME]}")"
+    target="${2:?usage: continuity-prefix register <slug> <exe> [--name NAME]}"
+    shift 2
+    name=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --name) [ $# -ge 2 ] || continuity_die "--name needs a value"; name="$2"; shift 2 ;;
+        *) continuity_die "unknown option for register: $1" ;;
+      esac
+    done
+    [ -f "$target" ] || continuity_die "no such executable: $target"
+    exe_abs="$(readlink -f -- "$target")"
+    drive="$(prefix_drive_c "$slug")"
+    case "$exe_abs" in
+      "$drive"/*) rel="${exe_abs#"$drive"/}" ;;
+      *) rel="$exe_abs" ;;
+    esac
+    base="${exe_abs##*/}"; stem="${base%.*}"
+    [ -n "$name" ] || name="$stem"
+    icon="application-x-executable"
+    if [ -e "$CONTINUITY_ASSET_DIR/icons/windows-app.svg" ]; then
+      icon="$CONTINUITY_ASSET_DIR/icons/windows-app.svg"
+    fi
+    if extracted="$(exe_icon "$exe_abs" "$(continuity_slugify "$stem")" "$CONTINUITY_STATE_DIR/icons/$slug" 2>/dev/null)"; then
+      icon="$extracted"
+    fi
+    out="$(write_launcher "$slug" "$exe_abs" "$name" "$icon" "$rel")" || \
+      continuity_die "could not write a launcher for '$exe_abs'"
+    continuity_refresh_desktop_db
+    continuity_ok "launcher: $name -> $out"
     ;;
 
   rm)

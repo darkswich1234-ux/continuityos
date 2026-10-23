@@ -65,6 +65,11 @@ LAUNCHER OPTIONS
   -i, --installer      Treat the input as an installer; after it exits successfully,
                        scan the prefix and register launchers for new executables
   -a, --add-launcher   Always scan the prefix and register launchers afterwards
+      --no-launcher    Do not register an application-menu entry for this launch
+
+By default every launch registers a menu entry for the program you ran, named
+so that the next click runs the same prefix. -i/-a additionally scan the prefix
+for programs an installer created.
 
 OTHER
   -T, --terminal       Run attached to a terminal (for console installers)
@@ -105,6 +110,7 @@ RESET=0
 NEW_PREFIX=0
 IS_INSTALLER=0
 ADD_LAUNCHER=0
+NO_LAUNCHER=0
 TERMINAL=0
 POSITIONAL=()
 APP_ARGS=()
@@ -124,6 +130,7 @@ while [ $# -gt 0 ]; do
     -d|--dir)              [ $# -ge 2 ] || continuity_die "$1 needs an argument"; WORKDIR="$2"; shift 2 ;;
     -i|--installer)        IS_INSTALLER=1; shift ;;
     -a|--add-launcher)     ADD_LAUNCHER=1; shift ;;
+    --no-launcher)         NO_LAUNCHER=1; shift ;;
     -T|--terminal)         TERMINAL=1; shift ;;
     -q|--quiet)            QUIET=1; shift ;;
     --print-env)           PRINT_ENV=1; shift ;;
@@ -364,6 +371,22 @@ rc=$?
 set -e
 
 [ "$rc" -eq 0 ] || continuity_warn "'$TARGET_BASE' exited with status $rc"
+
+# --- desktop entry ------------------------------------------------------------
+# Running a program is enough to make it a native app: it gets an entry in the
+# application menu that launches the same prefix. This is deliberately not tied
+# to the exit status, because games routinely quit with a non-zero code after
+# working correctly. Installers are excluded (the setup program is not the app),
+# and so is the prefix's own plumbing.
+REGISTER_LAUNCHERS="${CONTINUITY_REGISTER_LAUNCHERS:-1}"
+[ "$NO_LAUNCHER" = "1" ] && REGISTER_LAUNCHERS=0
+if [ "$REGISTER_LAUNCHERS" = "1" ] && [ "$IS_INSTALLER" != "1" ] \
+   && [ "$TARGET_EXT" != "msi" ] && ! continuity_is_system_exe "$TARGET_ABS"; then
+  if continuity_have continuity-prefix; then
+    continuity-prefix register "$SLUG" "$TARGET_ABS" || \
+      continuity_warn "could not register a launcher for '$TARGET_BASE'"
+  fi
+fi
 
 # --- post-install launcher discovery -----------------------------------------
 if [ "$rc" -eq 0 ] && { [ "$IS_INSTALLER" = "1" ] || [ "$ADD_LAUNCHER" = "1" ] || [ "${CONTINUITY_AUTO_LAUNCHERS:-0}" = "1" ]; }; then

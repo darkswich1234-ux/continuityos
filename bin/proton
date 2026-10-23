@@ -88,6 +88,8 @@ LAUNCHING
     -n, --name NAME     prefix + launcher name (default: from the file name)
     -i, --installer     install, then register launchers for what it created
     -N, --native        use system Wine instead of Proton
+    --no-launcher       do not add an application-menu entry for this run
+    (any launch already adds one for the program you ran)
     --direct            host Proton build without UMU
     -P, --proton PATH   select a Proton build (implies --direct)
     --print-env         print the resolved environment and launch nothing

@@ -119,6 +119,28 @@ continuity_prefix_drive_c() {
   if [ -d "$dir/pfx/drive_c" ]; then printf '%s/pfx/drive_c' "$dir"; else printf '%s/drive_c' "$dir"; fi
 }
 
+# Executables that are part of the Windows installation itself rather than
+# programs the user installed. Registering these would fill the application menu
+# with Internet Explorer, Media Player and WordPad from every fresh prefix.
+# Shared so the launcher writer and the launch path agree on what to skip.
+continuity_is_system_exe() {
+  local name rel
+  rel="$1"
+  name="${rel##*/}"
+  case "$rel" in
+    windows/*|*/windows/*|*/Windows/*) return 0 ;;
+    *Microsoft.NET*|*Installer*|*WinMetadata*) return 0 ;;
+    */unins*.exe|*/Unins*.exe|*/uninstall*.exe) return 0 ;;
+    *"/Internet Explorer/"*|*"/Windows Media Player/"*) return 0 ;;
+    *"/Windows NT/Accessories/"*) return 0 ;;
+  esac
+  case "$name" in
+    rundll32.exe|msiexec.exe|regsvr32.exe|cmd.exe|explorer.exe) return 0 ;;
+    iexplore.exe|wmplayer.exe|wordpad.exe|notepad.exe|regedit.exe) return 0 ;;
+  esac
+  return 1
+}
+
 # ---------------------------------------------------------------------------
 # Distribution family
 # ---------------------------------------------------------------------------

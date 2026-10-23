@@ -32,8 +32,9 @@ it. The Proton build itself and the Steam Linux Runtime are downloaded by
 ## Use
 
 ```bash
-proton GameSetup.exe                     # own prefix, named after the file
-proton --installer GameSetup.exe         # install, then register launchers
+proton GameSetup.exe                     # own prefix + app-menu entry, named after the file
+proton --installer GameSetup.exe         # install, then register launchers for what it made
+proton --no-launcher Game.exe            # same, without the app-menu entry
 proton --name mygame Game.exe            # choose the prefix name
 proton --native legacy-tool.exe          # system Wine instead of Proton
 proton --print-env Game.exe              # resolved environment, launch nothing
@@ -47,6 +48,10 @@ proton import mygame.tar.zst mygame      # restore one
 proton check [--json] [--probe]          # Vulkan, 32-bit, Wine, Proton, UMU
 proton version                           # engine, umu-run, prefix locations
 ```
+
+Launching a program registers an application-menu entry for it, so a Windows
+game behaves like a native app from then on; `proton launchers <slug>` rebuilds
+the entries for a prefix, and `proton launchers <slug> --remove` takes them away.
 
 A prefix is just a directory, so one broken game only ruins its own:
 

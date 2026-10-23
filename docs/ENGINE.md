@@ -46,6 +46,23 @@ edits a user's home directory: new accounts pick the configuration up from
 engine, `PROTONPATH`, the command that would run — and launches nothing. That is
 what the installer's own verification step uses.
 
+## Native-app entries
+
+A launch ends by writing one desktop entry for the program that was run, under
+`<apps>/continuity/<slug>/`. The entry invokes `continuity-run --name <slug>` on
+the same executable, so clicking it reuses that prefix and its settings. It is
+written regardless of the exit status — games routinely quit non-zero after
+working — and it is skipped for installers (`-i`), `.msi` files and the Windows
+installation's own programs (Internet Explorer, Media Player, WordPad,
+uninstallers), which would otherwise bury the entry you wanted. Icons are
+extracted from the executable when `icoutils` is installed.
+
+`proton launchers <slug>` is the complementary command: it scans the entire
+prefix and registers every user program inside it, which is what makes an
+installer's output clickable. `--remove` deletes the entries, and `proton rm
+<slug>` deletes them together with the prefix. `--no-launcher`, or
+`CONTINUITY_REGISTER_LAUNCHERS=0`, suppresses the per-launch entry.
+
 ## Configuration
 
 `environment.conf` is sourced by every command, and only `CONTINUITY_*` keys are
@@ -59,7 +76,8 @@ group/world writable. The shipped defaults are documented in
 | `CONTINUITY_PREFIX_ROOT` | where prefixes live |
 | `CONTINUITY_PROTONPATH` | Proton build for `direct` mode |
 | `CONTINUITY_GAMEID` | UMU/Steam-compatible app id (default `0`) |
-| `CONTINUITY_AUTO_LAUNCHERS` | register launchers after every successful launch |
+| `CONTINUITY_REGISTER_LAUNCHERS` | register a menu entry for the program you launch (default `1`) |
+| `CONTINUITY_AUTO_LAUNCHERS` | additionally scan the whole prefix after a successful launch |
 | `CONTINUITY_GAMESCOPE`, `CONTINUITY_MANGOHUD` | wrap launches in gamescope / MangoHud |
 
 Command-line flags always win over the file.
