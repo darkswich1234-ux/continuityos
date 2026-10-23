@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Welcome to ContinuityOS
+GenericName=First-run Setup
+Comment=Set up Steam libraries, your first Windows program and the session style
+Exec=/usr/local/bin/continuity-wizard start
+TryExec=/usr/local/bin/continuity-wizard
+Icon=continuity-windows
+Terminal=false
+StartupNotify=true
+Categories=System;Settings;
+Keywords=setup;welcome;first run;steam;windows;gaming;oobe;

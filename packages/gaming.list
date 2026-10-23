@@ -1,0 +1,31 @@
+# ContinuityOS — CachyOS gaming stack (CachyOS repo + multilib required)
+# Install Proton/UMU system-wide; game processes always run as the logged-in user.
+# UMU + CachyOS SLR Proton is the non-Steam default; direct mode is opt-in.
+umu-launcher
+proton-cachyos-slr
+proton-cachyos-native
+
+# --- the compatibility engine -------------------------------------------------
+wine                 # multilib — Wine, used by continuity-run --native and .msi/.lnk
+wine-mono
+wine-gecko
+protontricks         # extra  — winetricks-style tweaks for Proton prefixes
+winetricks           # extra  — legacy prefix tweaking (used by continuity-prefix)
+vkd3d                # D3D12 -> Vulkan
+lib32-vkd3d
+
+# --- performance overlays and frame pacing -----------------------------------
+gamemode             # CPU governor/priority hints for games
+gamescope            # micro-compositor (continuity-run wraps with it on request)
+mangohud
+goverlay             # GUI for MangoHud/vkBasalt configuration
+vkbasalt
+
+# --- launchers and stores -----------------------------------------------------
+steam
+lutris
+game-devices-udev    # udev rules for controllers, wheels and other game devices
+
+# --- diagnostics --------------------------------------------------------------
+vulkan-tools
+mesa-utils

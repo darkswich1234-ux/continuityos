@@ -1,0 +1,13 @@
+# This project runs on Linux: a CRLF shebang makes the kernel look for an
+# interpreter called "bash\r". Store text as LF and check it out as LF everywhere.
+* text=auto eol=lf
+
+# PowerShell helpers are only ever run on Windows.
+*.ps1 text eol=crlf
+
+# Never let git normalise binary content.
+*.iso binary
+*.png binary
+*.ico binary
+*.gpg binary
+*.svg text

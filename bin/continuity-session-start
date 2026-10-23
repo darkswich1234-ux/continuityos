@@ -1,0 +1,148 @@
+#!/usr/bin/env bash
+# ContinuityOS — shell/session bootstrap (owned by Hyprland's exec-once).
+#
+# Starts the pieces that make the desktop look like a phone OS and keeps the
+# "one bootstrap" rule from docs/ARCHITECTURE.md: the Hyprland config never has
+# to know about Waybar, Eww, hyprpaper or dunst individually.
+#
+# Order matters: the daemons first, then the visible surfaces, then gaming mode
+# re-applies its look if the user left it on.
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-session-start: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+continuity_load_env
+continuity_ensure_dirs
+
+# Single instance: a second `exec` on config reload must not duplicate the shell.
+# The guard must only ever trigger when flock is actually available — a missing
+# flock reads as "the lock is held", which would make every login after the first
+# a silent no-op and leave the user with no shell at all.
+LOCK="${XDG_RUNTIME_DIR:-/tmp}/continuity-session-start.lock"
+if continuity_have flock; then
+  if exec 9>"$LOCK" 2>/dev/null; then
+    if ! flock -n 9 2>/dev/null; then
+      continuity_debug "another session bootstrap is running; exiting"
+      exit 0
+    fi
+  else
+    continuity_debug "cannot create $LOCK; skipping the single-instance guard"
+  fi
+else
+  continuity_debug "flock is not installed; skipping the single-instance guard"
+fi
+
+start_if_absent() {
+  local bin="$1"; shift
+  continuity_have "$bin" || { continuity_debug "$bin not installed, skipping"; return 0; }
+  if pgrep -x "$(basename "$bin")" >/dev/null 2>&1; then
+    continuity_debug "$bin already running"
+    return 0
+  fi
+  setsid "$bin" >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+}
+
+# --- wait for the compositor --------------------------------------------------
+if ! continuity_in_hyprland; then
+  continuity_warn "HYPRLAND_INSTANCE_SIGNATURE is not set — starting the shell anyway"
+fi
+for _ in $(seq 1 20); do
+  continuity_in_hyprland && break
+  sleep 0.25
+done
+
+# --- shell --------------------------------------------------------------------
+# The visible shell is the pinned illogical-impulse (ii) Quickshell config: bar,
+# dock, wallpaper, notifications and launcher. It is started with `qs -c ii`.
+# When the optional end4-pC overlay has been installed from its pinned commit,
+# that overlay replaces ii's panels, so it is launched instead (never both).
+# Quickshell is a single process per config; a second `qs` would duplicate panels.
+start_shell() {
+  local overlay_state
+  if continuity_have continuity-end4-pc; then
+    overlay_state="$(continuity-end4-pc status 2>/dev/null || true)"
+    if printf '%s\n' "$overlay_state" | grep -qx 'overlay=installed-pinned'; then
+      continuity_info "launching the pinned end4-pC overlay"
+      setsid continuity-end4-pc launch >/dev/null 2>&1 &
+      disown 2>/dev/null || true
+      return 0
+    fi
+  fi
+  if [ -d "${XDG_CONFIG_HOME:-$HOME/.config}/quickshell/ii" ] && continuity_have qs; then
+    if pgrep -x qs >/dev/null 2>&1; then
+      continuity_debug "quickshell already running"
+      return 0
+    fi
+    setsid qs -c ii >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+  else
+    continuity_warn "the ii shell is not installed under ~/.config/quickshell/ii — run the first-boot setup"
+  fi
+}
+
+# Idle management (lock/screen off/suspend) is independent of the shell.
+
+# --- surfaces -----------------------------------------------------------------
+# Gaming mode hides the chrome. Two things can ask for a lean session: a
+# leftover marker from last time, or the first-run wizard's "start lean" choice
+# (CONTINUITY_START_IN_GAMING_MODE in environment.conf).
+if [ -f "$CONTINUITY_STATE_DIR/gaming-mode.enabled" ] || [ "${CONTINUITY_START_IN_GAMING_MODE:-0}" = "1" ]; then
+  continuity_info "starting in gaming mode (marker or configured default)"
+  continuity-gaming-mode on --quiet || true
+else
+  start_shell
+fi
+
+start_if_absent hypridle
+
+# --- session plumbing ---------------------------------------------------------
+# Portal + polkit are started by systemd/dbus; the polkit agent is launched from
+# conf.d/autostart.conf because only one agent may run.
+
+# --- first run ---------------------------------------------------------------
+# Delayed so the dock and wallpaper are on screen behind whatever opens.
+launch_after() {
+  local delay="$1"; shift
+  if continuity_have setsid; then
+    setsid sh -c "sleep $delay; exec $*" >/dev/null 2>&1 &
+  else
+    sh -c "sleep $delay; exec $*" >/dev/null 2>&1 &
+  fi
+  disown 2>/dev/null || true
+}
+
+# The first run is a different thing depending on what this machine is:
+#   * a live medium: the disk installer. There is nothing worth configuring in
+#     RAM that survives a reboot, so showing the wizard here would waste the
+#     one moment the user is expecting to set the machine up.
+#   * an installed system: the wizard, once. `show-once` is a no-op after it has
+#     been completed or skipped, so this is safe on every single login.
+if [ -d /run/archiso ] || [ -e /run/continuity-installer.mode ]; then
+  mode="$(cat /run/continuity-installer.mode 2>/dev/null || printf 'guided')"
+  if [ "$mode" = "unattended" ]; then
+    continuity_info "unattended install requested — progress: /var/log/continuity-install.log"
+  elif [ -x /opt/continuityos/bin/continuity-installer ]; then
+    launch_after 1 /opt/continuityos/bin/continuity-installer ui
+  else
+    continuity_warn "live medium detected but /opt/continuityos/bin/continuity-installer is missing"
+    continuity_warn "install by hand with: sudo /opt/continuityos/install.sh --all --yes"
+  fi
+elif continuity_have continuity-wizard; then
+  launch_after 2 continuity-wizard show-once
+fi
+
+continuity_log "session-start complete"
+exit 0

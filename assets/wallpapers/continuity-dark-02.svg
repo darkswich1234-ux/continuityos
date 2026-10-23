@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ContinuityOS — continuity-dark-02 "Aurora Drift"
+  3840x2160. A soft diagonal aurora over near-black, deliberately low contrast in
+  the middle third where app windows and the dock sit.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="3840" height="2160" viewBox="0 0 3840 2160"
+     preserveAspectRatio="xMidYMid slice" role="img" aria-label="Dark aurora gradient">
+  <defs>
+    <linearGradient id="bg2" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0"    stop-color="#05060b"/>
+      <stop offset="0.55" stop-color="#080a14"/>
+      <stop offset="1"    stop-color="#03040a"/>
+    </linearGradient>
+
+    <linearGradient id="aur1" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"    stop-color="#12d6c0" stop-opacity="0"/>
+      <stop offset="0.35" stop-color="#1ad9b8" stop-opacity="0.42"/>
+      <stop offset="0.70" stop-color="#3f7bff" stop-opacity="0.26"/>
+      <stop offset="1"    stop-color="#3f7bff" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="aur2" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0"    stop-color="#a06bff" stop-opacity="0"/>
+      <stop offset="0.4"  stop-color="#8b5cf6" stop-opacity="0.30"/>
+      <stop offset="0.75" stop-color="#ff5fa2" stop-opacity="0.16"/>
+      <stop offset="1"    stop-color="#ff5fa2" stop-opacity="0"/>
+    </linearGradient>
+
+    <linearGradient id="glowLine" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0"    stop-color="#22e0c8" stop-opacity="0"/>
+      <stop offset="0.5"  stop-color="#5ff0d8" stop-opacity="0.65"/>
+      <stop offset="1"    stop-color="#22e0c8" stop-opacity="0"/>
+    </linearGradient>
+
+    <radialGradient id="vig2" cx="50%" cy="46%" r="70%">
+      <stop offset="0.6" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1"   stop-color="#000000" stop-opacity="0.70"/>
+    </radialGradient>
+
+    <filter id="blur120" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="120"/>
+    </filter>
+    <filter id="blur60" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="60"/>
+    </filter>
+  </defs>
+
+  <rect width="3840" height="2160" fill="url(#bg2)"/>
+
+  <!-- aurora ribbons -->
+  <g filter="url(#blur120)">
+    <path d="M-200 1560 C 700 1180, 1500 1660, 2400 1180 C 3000 880, 3500 1000, 4100 760
+             L4100 0 L-200 0 Z" fill="url(#aur1)" opacity="0.75"/>
+    <path d="M-200 2140 C 900 1900, 1700 2160, 2600 1760 C 3200 1480, 3700 1620, 4100 1400
+             L4100 2160 L-200 2160 Z" fill="url(#aur2)" opacity="0.8"/>
+  </g>
+
+  <!-- accent light streak -->
+  <g filter="url(#blur60)" opacity="0.5">
+    <path d="M420 1820 C 1180 1620, 2120 1780, 3480 1420"
+          stroke="url(#glowLine)" stroke-width="10" fill="none" stroke-linecap="round"/>
+  </g>
+
+  <!-- faint concentric rings, an Android-ish ripple motif -->
+  <g fill="none" stroke="#8ff5e6" stroke-opacity="0.055" stroke-width="2">
+    <circle cx="3120" cy="620" r="240"/>
+    <circle cx="3120" cy="620" r="420"/>
+    <circle cx="3120" cy="620" r="620"/>
+    <circle cx="3120" cy="620" r="860"/>
+  </g>
+
+  <!-- fine dot matrix, very low alpha -->
+  <g fill="#cfe9ff" opacity="0.10">
+    <g id="dots2">
+      <circle cx="160" cy="160" r="2"/><circle cx="360" cy="160" r="2"/>
+      <circle cx="560" cy="160" r="2"/><circle cx="760" cy="160" r="2"/>
+      <circle cx="960" cy="160" r="2"/><circle cx="1160" cy="160" r="2"/>
+      <circle cx="160" cy="360" r="2"/><circle cx="160" cy="560" r="2"/>
+      <circle cx="160" cy="760" r="2"/><circle cx="160" cy="960" r="2"/>
+      <circle cx="3680" cy="2000" r="2"/><circle cx="3480" cy="2000" r="2"/>
+      <circle cx="3280" cy="2000" r="2"/><circle cx="3080" cy="2000" r="2"/>
+      <circle cx="3680" cy="1800" r="2"/><circle cx="3680" cy="1600" r="2"/>
+      <circle cx="3680" cy="1400" r="2"/><circle cx="3680" cy="1200" r="2"/>
+    </g>
+  </g>
+
+  <rect width="3840" height="2160" fill="url(#vig2)"/>
+</svg>

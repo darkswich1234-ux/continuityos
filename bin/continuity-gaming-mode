@@ -1,0 +1,241 @@
+#!/usr/bin/env bash
+# ContinuityOS gaming mode — one switch that strips the desktop down to frames.
+#
+#   continuity-gaming-mode on        quiet, animated-free, "performance" session
+#   continuity-gaming-mode off       restore the saved desktop state
+#   continuity-gaming-mode toggle
+#   continuity-gaming-mode status    human readable; --json for scripts
+#
+# What "on" does:
+#   * Hyprland: animations off, blur/shadow off, rounding reduced, autoreload off
+#   * hides Waybar + the Eww dock/quick-settings drawer, stops dunst notifications
+#   * stops background churn (file indexers)
+#   * performance power profile when power-profiles-daemon is present
+#   * sets MangoHud/gamescope defaults for games launched from now on
+#
+# The previous state is written to $CONTINUITY_STATE_DIR/gaming-mode.state and
+# replayed by "off"; a marker file lets a new session restore the chosen mode.
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-gaming-mode: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+
+usage() {
+  cat <<'EOF'
+continuity-gaming-mode — toggle the ContinuityOS lean gaming session
+
+USAGE
+  continuity-gaming-mode <on|off|toggle|status> [options]
+
+OPTIONS
+      --json        machine readable status (status only)
+  -q, --quiet       no output except errors
+      --keep-bar    keep Waybar visible while gaming
+      --no-profile  do not touch the CPU power profile
+  -h, --help        This help
+
+FILES
+  ~/.local/state/continuity/gaming-mode.state   saved desktop state
+  ~/.local/state/continuity/gaming-mode.enabled marker for the next session
+EOF
+}
+
+ACTION=""
+JSON=0
+QUIET=0
+KEEP_BAR=0
+NO_PROFILE=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    on|off|toggle|status) ACTION="$1"; shift ;;
+    --json) JSON=1; shift ;;
+    -q|--quiet) QUIET=1; shift ;;
+    --keep-bar) KEEP_BAR=1; shift ;;
+    --no-profile) NO_PROFILE=1; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) continuity_die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+[ -n "$ACTION" ] || { usage >&2; exit 2; }
+
+continuity_load_env
+mkdir -p "$CONTINUITY_STATE_DIR" 2>/dev/null || true
+STATE_FILE="$CONTINUITY_STATE_DIR/gaming-mode.state"
+MARKER="$CONTINUITY_STATE_DIR/gaming-mode.enabled"
+
+say() { [ "$QUIET" = "1" ] && return 0; continuity_info "$@"; }
+
+is_enabled() { [ -f "$MARKER" ]; }
+
+proc_running() {
+  # name is matched with -x so we never kill the invoking shell.
+  continuity_have pgrep || return 1
+  pgrep -x "$1" >/dev/null 2>&1
+}
+
+# Background processes that steal frames; kept short and conservative.
+BACKGROUND_PROCS=(
+  baloo_file
+  baloo_file_extractor
+  tracker-miner-fs-3
+  tracker-miner-fs
+  zeitgeist-datahub
+  gvfsd-tracker
+)
+
+save_state() {
+  {
+    printf 'SAVED_AT=%s\n' "$(date -Is)"
+    printf 'ANIMATIONS=%s\n' "$(hyprctl getoption animations:enabled 2>/dev/null | awk -F': *' '/^int/{print $2}' || echo 1)"
+    printf 'WAYBAR_WAS_RUNNING=%s\n' "$(proc_running waybar && echo 1 || echo 0)"
+    printf 'EWW_WAS_RUNNING=%s\n' "$(proc_running eww && echo 1 || echo 0)"
+    printf 'DUNST_WAS_RUNNING=%s\n' "$(proc_running dunst && echo 1 || echo 0)"
+    printf 'PROFILE=%s\n' "$(powerprofilesctl get 2>/dev/null || echo unknown)"
+    for p in "${BACKGROUND_PROCS[@]}"; do
+      printf 'PROC_%s=%s\n' "$p" "$(proc_running "$p" && echo 1 || echo 0)"
+    done
+  } >"$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+state_value() {
+  [ -r "$STATE_FILE" ] || return 1
+  awk -F= -v k="$1" '$1==k {print $2; exit}' "$STATE_FILE"
+}
+
+enable_mode() {
+  save_state
+  say "entering gaming mode"
+
+  continuity_hypr_keyword animations:enabled 0
+  continuity_hypr_keyword decoration:blur:enabled 0
+  continuity_hypr_keyword decoration:shadow:enabled 0
+  continuity_hypr_keyword decoration:rounding 2
+  continuity_hypr_keyword general:gaps_in 4
+  continuity_hypr_keyword general:gaps_out 6
+  continuity_hypr_keyword misc:disable_autoreload 1
+  # Game windows should own the whole screen without shell chrome on top.
+  continuity_hypr keyword general:border_size 1
+
+  if [ "$KEEP_BAR" != "1" ]; then
+    # Waybar hides/shows on SIGUSR1.
+    if proc_running waybar; then pkill -USR1 waybar >/dev/null 2>&1 || true; fi
+    if continuity_have eww && proc_running eww; then
+      eww close-all >/dev/null 2>&1 || true
+    fi
+    # hide-all closes the drawer, the shade AND the dock: nothing should float
+    # on top of a fullscreen game.
+    if continuity_have continuity-panel; then continuity-panel hide-all >/dev/null 2>&1 || true; fi
+  fi
+
+  # Android-style heads-up notifications are the first thing you do not want
+  # over a fullscreen game.
+  if proc_running dunst; then pkill -x dunst >/dev/null 2>&1 || true; fi
+
+  for p in "${BACKGROUND_PROCS[@]}"; do
+    proc_running "$p" && pkill -x "$p" >/dev/null 2>&1 || true
+  done
+
+  if [ "$NO_PROFILE" != "1" ] && continuity_have powerprofilesctl; then
+    if powerprofilesctl set performance >/dev/null 2>&1; then
+      say "power profile: performance"
+    else
+      continuity_debug "could not set performance power profile"
+    fi
+  fi
+
+  touch "$MARKER"
+  if continuity_have notify-send; then
+    notify-send -u low -i input-gaming 'Gaming mode on' \
+      'Animations, blur and background indexers disabled.' 2>/dev/null || true
+  fi
+  continuity_log "gaming-mode on"
+  say "gaming mode enabled"
+}
+
+disable_mode() {
+  say "leaving gaming mode"
+
+  continuity_hypr_keyword animations:enabled 1
+  continuity_hypr_keyword decoration:blur:enabled 1
+  continuity_hypr_keyword decoration:shadow:enabled 1
+  continuity_hypr_keyword decoration:rounding 16
+  continuity_hypr_keyword general:gaps_in 5
+  continuity_hypr_keyword general:gaps_out 10
+  continuity_hypr_keyword misc:disable_autoreload 0
+  continuity_hypr_keyword general:border_size 2
+
+  if [ "$(state_value WAYBAR_WAS_RUNNING || echo 0)" = "1" ] && ! proc_running waybar; then
+    if continuity_have waybar; then
+      setsid waybar >/dev/null 2>&1 &
+    fi
+  elif proc_running waybar; then
+    # Waybar was left visible but may still be hidden from SIGUSR1.
+    pkill -USR1 waybar >/dev/null 2>&1 || true
+  fi
+
+  if [ "$(state_value EWW_WAS_RUNNING || echo 0)" = "1" ] && continuity_have eww; then
+    setsid eww daemon >/dev/null 2>&1 &
+    sleep 0.4
+    eww open dock >/dev/null 2>&1 || true
+  fi
+
+  if [ "$(state_value DUNST_WAS_RUNNING || echo 0)" = "1" ] && ! proc_running dunst && continuity_have dunst; then
+    setsid dunst >/dev/null 2>&1 &
+  fi
+
+  if [ "$NO_PROFILE" != "1" ] && continuity_have powerprofilesctl; then
+    prev="$(state_value PROFILE || echo balanced)"
+    case "$prev" in unknown|'') prev=balanced ;; esac
+    powerprofilesctl set "$prev" >/dev/null 2>&1 || true
+  fi
+
+  rm -f "$MARKER"
+  continuity_log "gaming-mode off"
+  if continuity_have notify-send; then
+    notify-send -u low -i video-display 'Gaming mode off' 'Desktop effects restored.' 2>/dev/null || true
+  fi
+  say "gaming mode disabled"
+}
+
+status() {
+  if is_enabled; then enabled=yes; else enabled=no; fi
+  anim="unknown"
+  if continuity_in_hyprland; then
+    anim="$(hyprctl getoption animations:enabled 2>/dev/null | awk -F': *' '/^int/{print $2}' || echo unknown)"
+  fi
+  bar="stopped"; proc_running waybar && bar="running"
+  prof="unknown"; continuity_have powerprofilesctl && prof="$(powerprofilesctl get 2>/dev/null || echo unknown)"
+
+  if [ "$JSON" = "1" ]; then
+    printf '{"enabled":%s,"animations":%s,"waybar":"%s","power_profile":"%s","state_file":"%s"}\n' \
+      "$([ "$enabled" = yes ] && echo true || echo false)" \
+      "${anim:-null}" "$bar" "$prof" "$STATE_FILE"
+    return 0
+  fi
+  printf 'Gaming mode:   %s\n' "$enabled"
+  printf 'Animations:    %s\n' "$anim"
+  printf 'Waybar:        %s\n' "$bar"
+  printf 'Power profile: %s\n' "$prof"
+  printf 'State file:    %s\n' "$STATE_FILE"
+}
+
+case "$ACTION" in
+  on)     enable_mode ;;
+  off)    disable_mode ;;
+  toggle) if is_enabled; then disable_mode; else enable_mode; fi ;;
+  status) status ;;
+esac

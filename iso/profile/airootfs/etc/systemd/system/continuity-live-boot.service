@@ -1,0 +1,32 @@
+[Unit]
+Description=ContinuityOS live medium boot hook
+Documentation=file:/opt/continuityos/iso/README.md
+# The live medium must come up with networking: archinstall's package
+# transaction needs it, and so does the installer's own payload copy.
+Wants=network.target NetworkManager.service
+After=network.target NetworkManager.service
+# The live account has to exist before the hook provisions into its home.
+After=systemd-sysusers.service
+# greetd takes tty1 for the graphical session (its own unit Conflicts= with
+# getty@tty1), so this hook no longer writes to the console or claims that VT:
+# it logs to /var/log/continuity-live.log and the journal, and the installer
+# window on the desktop is what the user actually reads.
+# The greetd ordering lives in greetd.service.d/10-continuity-live.conf, which
+# is the side that depends on this unit finishing.
+# Never run inside an installed system that happens to have this unit copied in.
+ConditionPathExists=/run/archiso
+ConditionPathIsReadWrite=/
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/root/.automated_script.sh
+# journal only — console output would land on the VT the session owns.
+StandardOutput=journal
+StandardError=journal
+# Generous, but bounded: if provisioning wedges, the desktop must still appear
+# (an unreachable terminal is worse than a live system without the CLI).
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,493 @@
+/* ContinuityOS — Eww shell styles.
+ *
+ * Material You, dark. The whole palette lives in the SCSS variables below so it
+ * can be re-themed in one place (eww compiles this file with libsass, so plain
+ * SCSS variables are available — unlike GTK CSS, which has no custom properties).
+ *
+ * Real backdrop blur is provided by Hyprland layer rules on the layer-shell
+ * namespaces (dock / drawer / notifications); GTK has no backdrop-filter, so the
+ * surfaces here are translucent and lean on that blur.
+ */
+
+/* ---- palette (single source of truth) --------------------------------- */
+$bg:          rgba(13, 13, 17, 0.74);
+$surface:     rgba(28, 27, 31, 0.82);
+$surface-2:   rgba(39, 38, 43, 0.86);
+$surface-3:   rgba(52, 51, 57, 0.90);
+$primary:     #a8c7fa;
+$on-primary:  #08182d;
+$secondary:   #c2e7ff;
+$on-surface:  #e6e1e5;
+$muted:       rgba(230, 225, 229, 0.62);
+$faint:       rgba(230, 225, 229, 0.38);
+$outline:     rgba(230, 225, 229, 0.12);
+$error:       #ffb4ab;
+$error-bg:    rgba(255, 180, 171, 0.18);
+$good:        #b7f0c0;
+
+/* ---- geometry --------------------------------------------------------- */
+$r-xl: 28px;
+$r-lg: 24px;
+$r-md: 18px;
+$r-sm: 14px;
+$r-pill: 9999px;
+$ease: 240ms;
+
+* {
+  font-family: "Inter", "Roboto", "Noto Sans", sans-serif;
+  font-size: 13px;
+  color: $on-surface;
+  transition: background-color $ease, color $ease, border-color $ease, min-height $ease;
+}
+
+/* ======================================================================= */
+/* Dock                                                                    */
+/* ======================================================================= */
+.dock { background: transparent; padding: 0 0 10px 0; }
+
+.dock-inner {
+  background-color: $surface;
+  border: 1px solid $outline;
+  border-radius: $r-lg;
+  padding: 6px 10px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.42);
+}
+
+.dock-item {
+  background-color: transparent;
+  border: none;
+  border-radius: $r-md;
+  padding: 8px 14px;
+  margin: 0 2px;
+  min-height: 34px;
+  box-shadow: none;
+
+  &:hover {
+    background-color: $surface-3;
+    min-height: 40px;
+  }
+  &:active { background-color: $primary; }
+}
+
+.dock-label {
+  font-size: 12px;
+  font-weight: 600;
+  color: $on-surface;
+  letter-spacing: 0.2px;
+}
+
+.dock-item:hover .dock-label { color: #ffffff; }
+.dock-item-apps { background-color: $surface-2; }
+.dock-item-freebuff { background-color: rgba(168, 199, 250, 0.14); }
+.dock-item-freebuff .dock-label { color: $primary; }
+.dock-item-windows { background-color: rgba(194, 231, 255, 0.12); }
+.dock-item-windows .dock-label { color: $secondary; }
+.dock-item-panel { background-color: $surface-2; }
+.dock-item-panel .dock-label { font-weight: 700; }
+
+/* ======================================================================= */
+/* Drawer (quick settings shade)                                           */
+/* ======================================================================= */
+.drawer {
+  background-color: $bg;
+  border: 1px solid $outline;
+  border-radius: $r-xl;
+  padding: 16px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.drawer-head {
+  padding: 6px 6px 14px 6px;
+  margin-bottom: 8px;
+  border-bottom: 1px solid $outline;
+}
+
+.head-clock { font-size: 34px; font-weight: 700; letter-spacing: -0.5px; }
+.head-date  { font-size: 12px; color: $muted; }
+.drawer-head-status { margin-right: 8px; }
+.head-battery { font-size: 12px; font-weight: 600; color: $on-surface; }
+.head-cpu     { font-size: 11px; color: $faint; }
+
+.head-close {
+  background-color: $surface-2;
+  border-radius: $r-pill;
+  border: none;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  &:hover { background-color: rgba(255, 180, 171, 0.30); }
+}
+.head-close label { font-size: 13px; font-weight: 700; }
+
+/* ---- connectivity tiles ---------------------------------------------- */
+.tiles { margin-bottom: 8px; }
+
+.tile {
+  background-color: $surface;
+  border: 1px solid $outline;
+  border-radius: $r-lg;
+  padding: 14px;
+  margin: 0 4px;
+  min-height: 78px;
+  min-width: 190px;
+  box-shadow: none;
+
+  &:hover { background-color: $surface-2; }
+}
+
+.tile-inner { padding: 2px; }
+
+.tile-icon {
+  font-size: 20px;
+  min-width: 30px;
+  color: $on-surface;
+}
+
+.tile-text { margin-left: 8px; }
+
+.tile-title    { font-size: 13px; font-weight: 700; }
+.tile-subtitle { font-size: 11px; color: $muted; }
+
+/* Active (on) connectivity tiles get the Material "filled" treatment. */
+.tile-on {
+  background-color: rgba(168, 199, 250, 0.20);
+  border-color: rgba(168, 199, 250, 0.42);
+}
+.tile-on .tile-icon,
+.tile-on .tile-title { color: $primary; }
+.tile-off .tile-icon { color: $faint; }
+
+/* ---- cards ------------------------------------------------------------ */
+.card {
+  background-color: $surface;
+  border: 1px solid $outline;
+  border-radius: $r-lg;
+  padding: 12px 14px;
+  margin: 6px 0;
+}
+
+.card-head { margin-bottom: 8px; }
+.card-title    { font-size: 13px; font-weight: 700; }
+.card-subtitle { font-size: 11px; color: $muted; margin-left: auto; }
+
+/* ---- sliders ---------------------------------------------------------- */
+.slider-row { padding: 4px 0; }
+
+.slider-icon-btn {
+  background-color: $surface-2;
+  border: none;
+  border-radius: $r-pill;
+  min-width: 30px;
+  min-height: 30px;
+  padding: 0;
+  &:hover { background-color: $primary; }
+}
+.slider-icon { font-size: 14px; }
+.slider-icon-btn:hover .slider-icon { color: $on-primary; }
+
+.slider {
+  margin: 0 10px;
+  padding: 6px 0;
+
+  trough {
+    min-height: 10px;
+    border-radius: $r-pill;
+    background-color: rgba(230, 225, 229, 0.16);
+  }
+  highlight {
+    min-height: 10px;
+    border-radius: $r-pill;
+    background-color: $primary;
+  }
+  slider {
+    min-width: 14px;
+    min-height: 14px;
+    margin: -4px 0;
+    border-radius: $r-pill;
+    background-color: #ffffff;
+    border: 2px solid $primary;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.45);
+  }
+  &:hover slider { min-width: 18px; min-height: 18px; }
+}
+
+.slider-value {
+  min-width: 42px;
+  font-size: 11px;
+  font-weight: 600;
+  color: $muted;
+}
+
+.slider-mic trough highlight { background-color: $secondary; }
+.slider-brightness trough highlight { background-color: #ffe0a3; }
+
+/* Muted output: the slider turns grey so mute is obvious at a glance. */
+.slider-muted-1 trough highlight { background-color: $faint; }
+.slider-muted-1 .slider-value { color: $error; }
+
+/* ---- performance segmented control ------------------------------------ */
+.segments { margin: 2px 0 10px 0; }
+
+.seg {
+  background-color: $surface-2;
+  border: 1px solid transparent;
+  border-radius: $r-pill;
+  padding: 9px 18px;
+  margin: 0 4px;
+  min-height: 34px;
+
+  &:hover { background-color: $surface-3; }
+}
+
+.seg-label { font-size: 12px; font-weight: 700; }
+
+/* The active segment is chosen purely by interpolating state into the class:
+   seg-balanced-off / seg-gaming-on are the enabled ones. */
+.seg-balanced-off {
+  background-color: $primary;
+  border-color: $primary;
+}
+.seg-balanced-off .seg-label { color: $on-primary; }
+
+.seg-gaming-on {
+  background-color: $good;
+  border-color: $good;
+}
+.seg-gaming-on .seg-label { color: #06280d; }
+
+/* ---- chips ------------------------------------------------------------ */
+.chips { margin-top: 2px; }
+.chip {
+  background-color: rgba(230, 225, 229, 0.10);
+  border-radius: $r-pill;
+  padding: 5px 11px;
+  margin-right: 6px;
+}
+
+.chip-label { font-size: 11px; color: $muted; }
+
+/* ---- notification summary card ---------------------------------------- */
+.card-notifications { padding: 12px 14px; }
+.mini-btn {
+  background-color: $surface-2;
+  border: none;
+  border-radius: $r-pill;
+  padding: 6px 12px;
+  margin-left: 6px;
+
+  &:hover { background-color: $primary; }
+  label { font-size: 11px; font-weight: 600; }
+  &:hover label { color: $on-primary; }
+}
+
+/* Do-not-disturb engaged: the DND button reads as "on". */
+.mini-btn-dnd-1 { background-color: $primary; }
+.mini-btn-dnd-1 label { color: $on-primary; }
+
+/* ---- power ------------------------------------------------------------ */
+.card-power { padding-bottom: 14px; }
+.power-row { margin-top: 6px; }
+
+.power-btn {
+  background-color: $surface-2;
+  border: 1px solid $outline;
+  border-radius: $r-md;
+  padding: 10px 4px;
+  margin: 0 3px;
+
+  &:hover { background-color: $surface-3; }
+  label { font-size: 11px; font-weight: 600; }
+}
+
+.power-btn-danger:hover {
+  background-color: $error-bg;
+  border-color: $error;
+}
+.power-btn-danger:hover label { color: $error; }
+
+/* ======================================================================= */
+/* Notification centre                                                     */
+/* ======================================================================= */
+.notif {
+  background-color: $bg;
+  border: 1px solid $outline;
+  border-radius: $r-xl;
+  padding: 16px;
+  box-shadow: 0 24px 64px rgba(0, 0, 0, 0.55);
+}
+
+.notif-head { padding-bottom: 8px; border-bottom: 1px solid $outline; }
+.notif-title { font-size: 20px; font-weight: 700; }
+.notif-subtitle { font-size: 11px; color: $muted; margin: 6px 0 10px 0; }
+
+.notif-scroll { padding-right: 4px; }
+
+.notif-list { padding: 2px; }
+
+.notif-body {
+  background-color: $surface;
+  border: 1px solid $outline;
+  border-radius: $r-md;
+  padding: 12px;
+  margin-bottom: 8px;
+}
+
+.notif-body-label { font-size: 12px; }
+
+/* Scrollbar styling (GTK) */
+scrollbar {
+  background-color: transparent;
+  slider {
+    background-color: rgba(230, 225, 229, 0.22);
+    border-radius: $r-pill;
+    min-width: 6px;
+  }
+}
+
+/* ======================================================================= */
+/* First-run wizard                                                         */
+/* ======================================================================= */
+/* One centred card per step. Backdrop blur comes from the Hyprland layer rule
+   matching match:namespace ^wizard — GTK cannot blur what is behind it. */
+
+.wizard-card {
+  background-color: $bg;
+  border: 1px solid $outline;
+  border-radius: $r-xl;
+  padding: 30px 34px;
+  box-shadow: 0 28px 72px rgba(0, 0, 0, 0.62);
+}
+
+.wiz-head { margin-bottom: 14px; }
+
+.wiz-step {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 2.4px;
+  color: $primary;
+  margin-bottom: 6px;
+}
+
+.wiz-title {
+  font-size: 30px;
+  font-weight: 700;
+  color: $on-surface;
+  margin-bottom: 8px;
+}
+
+.wiz-subtitle {
+  font-size: 13px;
+  color: $muted;
+  line-height: 1.5;
+}
+
+.wiz-body {
+  font-size: 12px;
+  color: $muted;
+  line-height: 1.6;
+  margin-top: 10px;
+}
+
+/* --- fact rows -------------------------------------------------------- */
+.wiz-facts {
+  background-color: $surface;
+  border: 1px solid $outline;
+  border-radius: $r-lg;
+  padding: 14px 16px;
+  margin-top: 14px;
+}
+
+.wiz-fact {
+  padding: 4px 0;
+}
+
+.wiz-fact-icon {
+  color: $primary;
+  font-size: 12px;
+  min-width: 18px;
+  margin-right: 8px;
+}
+
+.wiz-fact-text {
+  font-size: 12px;
+  color: $on-surface;
+}
+
+/* --- actions ---------------------------------------------------------- */
+.wiz-choices { margin-top: 12px; }
+
+.wiz-actions { margin-top: 22px; }
+
+.wiz-btn {
+  background-color: $surface-2;
+  border: 1px solid $outline;
+  border-radius: $r-pill;
+  padding: 12px 22px;
+  margin-left: 8px;
+  min-height: 22px;
+}
+
+.wiz-btn label { font-size: 13px; font-weight: 600; }
+
+.wiz-btn:hover {
+  background-color: $surface-3;
+  border-color: rgba(230, 225, 229, 0.24);
+}
+
+/* The one action that moves the flow forward. */
+.wiz-btn-primary {
+  background-color: $primary;
+  border-color: $primary;
+}
+
+.wiz-btn-primary label { color: $on-primary; }
+
+.wiz-btn-primary:hover {
+  background-color: $secondary;
+  border-color: $secondary;
+}
+
+/* Secondary, lower-emphasis action. */
+.wiz-btn-ghost {
+  background-color: transparent;
+}
+
+.wiz-btn-ghost label { color: $muted; }
+
+.wiz-btn-ghost:hover label { color: $on-surface; }
+
+/* --- status chip ------------------------------------------------------ */
+/* The engine reports a closed vocabulary (pass|warn|fail|unknown) and the
+   window picks the colour from it, so one poll can colour a whole card. */
+.wiz-chip {
+  border-radius: $r-pill;
+  padding: 7px 14px;
+  margin: 2px 0 8px 0;
+  background-color: $surface-2;
+  border: 1px solid $outline;
+}
+
+.wiz-chip-text {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.wiz-chip-pass { background-color: rgba(183, 240, 192, 0.16); border-color: rgba(183, 240, 192, 0.42); }
+.wiz-chip-pass .wiz-chip-text { color: $good; }
+
+.wiz-chip-warn { background-color: rgba(255, 214, 140, 0.16); border-color: rgba(255, 214, 140, 0.42); }
+.wiz-chip-warn .wiz-chip-text { color: #ffd68c; }
+
+.wiz-chip-fail { background-color: $error-bg; border-color: rgba(255, 180, 171, 0.42); }
+.wiz-chip-fail .wiz-chip-text { color: $error; }
+
+.wiz-chip-unknown .wiz-chip-text { color: $muted; }
+
+/* --- errors ----------------------------------------------------------- */
+/* Kept in the tree even when empty: the engine clears ERROR on success, and a
+   blank line costs nothing next to re-rendering the whole card conditionally. */
+.wiz-error {
+  font-size: 11px;
+  color: $error;
+  margin-top: 12px;
+}

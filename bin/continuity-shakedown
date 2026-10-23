@@ -1,0 +1,807 @@
+#!/usr/bin/env bash
+# ContinuityOS — hardware & engine readiness probe.
+#
+# Answers one question: will Windows games actually run on this machine, and if
+# not, exactly what is missing? It is both a standalone CLI and the engine behind
+# the first-run wizard's "can this machine game?" step, so the human output format
+# is a contract the wizard parses:
+#
+#   STATUS key single-line-detail        STATUS is PASS|WARN|FAIL|SKIP
+#   FIX key exact-command                (only with --fix, only for non-PASS)
+#   SUMMARY <n> checks: <p> pass, <w> warn, <f> fail, <s> skip
+#
+# The 32-bit checks are the ones that matter most: a 64-bit Vulkan stack with no
+# lib32 equivalent runs modern games fine and then dies on every 32-bit one, with
+# an error that says nothing about the real cause.
+#
+# It is a *probe*, never a repair: it reports and suggests, and only --probe
+# creates (and then removes) a throwaway prefix. Nothing here needs root, network
+# or a session, and a missing optional tool is a WARN, never a crash.
+#
+#   continuity-shakedown                the report
+#   continuity-shakedown --json         machine-readable, for the wizard
+#   continuity-shakedown --quiet        only the problems
+#   continuity-shakedown --fix          plus the exact command for each problem
+#   continuity-shakedown --probe        also run a real Windows program (~1-3 min)
+#   continuity-shakedown --prune        delete a leftover probe prefix
+#
+# EXIT: 0 = no FAIL, 1 = at least one FAIL (or a failed probe), 2 = usage error.
+set -euo pipefail
+
+# --- locate the shared library ------------------------------------------------
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-shakedown: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+
+JSON=0
+QUIET=0
+FIX=0
+PROBE=0
+PRUNE=0
+PREFIX_ROOT_OVERRIDE=""
+
+usage() {
+  cat <<'EOF'
+continuity-shakedown — will Windows games actually run on this machine?
+
+USAGE
+  continuity-shakedown [--json] [--quiet] [--fix] [--probe] [--prune] [--prefix DIR]
+
+OPTIONS
+  --json          One JSON object on stdout (used by the first-run wizard)
+  --quiet         Print only the checks that are not PASS
+  --fix           Also print `FIX <key> <command>` for everything that needs work
+  --probe         Additionally launch a real Windows program in a throwaway
+                  prefix (wine only, hard 180s cap, 1-3 minutes). The prefix is
+                  deleted afterwards unless CONTINUITY_KEEP_PROBE=1
+  --prune         Delete a leftover probe prefix (and any stale lock) and exit
+  --prefix DIR    Where throwaway prefixes are created (default: your prefix root)
+  -h, --help      This help
+
+OUTPUT
+  STATUS key detail          one line per check, STATUS = PASS|WARN|FAIL|SKIP
+  FIX key command            the remedy for a non-PASS check (only with --fix)
+  SUMMARY n checks: p pass, w warn, f fail, s skip
+
+  With --json the same results appear as
+  {"ok":true,"checks":[{"key":..,"status":..,"detail":..,"fix":..}],"counts":{..}}
+
+EXIT STATUS
+  0  nothing FAILed     1  at least one FAIL (or the probe failed)     2  usage
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --json)        JSON=1; shift ;;
+    --quiet|-q)    QUIET=1; shift ;;
+    --fix)         FIX=1; shift ;;
+    --probe)       PROBE=1; shift ;;
+    --prune)       PRUNE=1; shift ;;
+    --prefix)      [ -n "${2:-}" ] || { echo "$PROG: --prefix needs a directory" >&2; exit 2; }
+                   PREFIX_ROOT_OVERRIDE="$2"; shift 2 ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
+  esac
+done
+
+continuity_load_env
+continuity_ensure_dirs
+[ -n "$PREFIX_ROOT_OVERRIDE" ] && CONTINUITY_PREFIX_ROOT="$PREFIX_ROOT_OVERRIDE"
+PREFIX_ROOT="$CONTINUITY_PREFIX_ROOT"
+PROBE_DIR="$PREFIX_ROOT/shakedown-probe"
+
+# --- results ------------------------------------------------------------------
+# Parallel arrays, appended in check order: the report is printed in the order the
+# checks ran, which is the order a person wants to read them in.
+RES_KEYS=(); RES_STATUS=(); RES_DETAIL=(); RES_FIX=()
+
+record() {
+  RES_KEYS+=("$1")
+  RES_STATUS+=("$2")
+  # A detail with a newline would break the line-per-check contract the wizard
+  # parses, so flatten it here rather than trusting every caller.
+  RES_DETAIL+=("$(printf '%s' "$3" | tr '\n' ' ')")
+  RES_FIX+=("${4:-}")
+  return 0
+}
+
+count_status() {
+  local want="$1" i n=0
+  for i in "${!RES_STATUS[@]}"; do
+    [ "${RES_STATUS[$i]}" = "$want" ] && n=$((n+1))
+  done
+  printf '%s' "$n"
+}
+
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+emit_results() {
+  local i p=0 w=0 f=0 s=0 total=0 ok_json first
+  for i in "${!RES_STATUS[@]}"; do
+    total=$((total+1))
+    case "${RES_STATUS[$i]}" in
+      PASS) p=$((p+1)) ;;
+      WARN) w=$((w+1)) ;;
+      FAIL) f=$((f+1)) ;;
+      *)    s=$((s+1)) ;;
+    esac
+  done
+
+  if [ "$JSON" = "1" ]; then
+    if [ "$f" -eq 0 ]; then ok_json=true; else ok_json=false; fi
+    printf '{"ok":%s,"checks":[' "$ok_json"
+    first=1
+    for i in "${!RES_KEYS[@]}"; do
+      [ "$first" = "1" ] || printf ','
+      first=0
+      printf '{"key":"%s","status":"%s","detail":"%s","fix":"%s"}' \
+        "$(json_escape "${RES_KEYS[$i]}")" \
+        "$(json_escape "${RES_STATUS[$i]}")" \
+        "$(json_escape "${RES_DETAIL[$i]}")" \
+        "$(json_escape "${RES_FIX[$i]}")"
+    done
+    printf '],"counts":{"pass":%s,"warn":%s,"fail":%s,"skip":%s}}\n' "$p" "$w" "$f" "$s"
+    return 0
+  fi
+
+  for i in "${!RES_KEYS[@]}"; do
+    if [ "$QUIET" = "1" ] && [ "${RES_STATUS[$i]}" = "PASS" ]; then
+      continue
+    fi
+    printf '%s %s %s\n' "${RES_STATUS[$i]}" "${RES_KEYS[$i]}" "${RES_DETAIL[$i]}"
+    if [ "$FIX" = "1" ] && [ "${RES_STATUS[$i]}" != "PASS" ] && [ -n "${RES_FIX[$i]}" ]; then
+      printf 'FIX %s %s\n' "${RES_KEYS[$i]}" "${RES_FIX[$i]}"
+    fi
+  done
+  printf 'SUMMARY %s checks: %s pass, %s warn, %s fail, %s skip\n' "$total" "$p" "$w" "$f" "$s"
+  return 0
+}
+
+# Cap a command's runtime when coreutils is present. Every caller must still
+# handle a non-zero status: a probe that fails is information, not a crash.
+run_capped() {
+  local secs="$1"; shift
+  if continuity_have timeout; then
+    timeout "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# Pull `key = value` out of vulkaninfo's summary text. Everything is done with
+# index()/substr() so a key can never leak regex metacharacters into a pattern,
+# and a missing key is an empty answer rather than an error.
+vfield() {
+  printf '%s\n' "$1" | awk -v k="$2" '
+    {
+      line = $0
+      sub(/^[[:space:]]+/, "", line)
+      sub(/[[:space:]]+$/, "", line)
+      eq = index(line, "=")
+      if (eq < 2) next
+      kp = substr(line, 1, eq - 1)
+      sub(/[[:space:]]+$/, "", kp)
+      if (kp != k) next
+      v = substr(line, eq + 1)
+      sub(/^[[:space:]]+/, "", v)
+      sub(/[[:space:]]+$/, "", v)
+      print v
+      exit
+    }'
+}
+
+# --- GPU facts ----------------------------------------------------------------
+CARD_LINES=()      # one entry per DRM card: card|vendor|device|driver|name
+LSPCI_CACHE=""
+LSPCI_LOADED=0
+VENDOR_KIND=""     # amd | intel | nvidia | unknown, from the first card
+
+vendor_kind() {
+  case "$1" in
+    0x1002) printf 'amd' ;;
+    0x10de) printf 'nvidia' ;;
+    0x8086) printf 'intel' ;;
+    *)      printf 'unknown' ;;
+  esac
+}
+
+vendor_pretty() {
+  case "$1" in
+    0x1002) printf 'AMD' ;;
+    0x10de) printf 'NVIDIA' ;;
+    0x8086) printf 'Intel' ;;
+    *)      printf 'unknown vendor' ;;
+  esac
+}
+
+# The full 64-bit + 32-bit stack for one vendor. Asking for all of it is the
+# point: half of it is exactly the failure this check exists to catch.
+# Package names differ per distribution, so the remedy is built from the local
+# family (see continuity_pkg_command) instead of a hardcoded pacman line.
+vulkan_fix() {
+  local logicals
+  case "$1" in
+    amd)    logicals="vulkan-tools mesa mesa32 vulkan-amd vulkan-amd32 vulkan-loader32" ;;
+    intel)  logicals="vulkan-tools mesa mesa32 vulkan-intel vulkan-intel32 vulkan-loader32" ;;
+    nvidia) logicals="vulkan-tools nvidia nvidia32 vulkan-loader32" ;;
+    *)      logicals="vulkan-tools mesa mesa32 vulkan-loader32" ;;
+  esac
+  # shellcheck disable=SC2086
+  continuity_pkg_command $logicals \
+    || printf 'install the Vulkan loader, your GPU vendor driver and their 32-bit counterparts'
+}
+
+lspci_cache() {
+  [ "$LSPCI_LOADED" = "1" ] && return 0
+  LSPCI_LOADED=1
+  if continuity_have lspci; then
+    LSPCI_CACHE="$(lspci -nn 2>/dev/null || printf '')"
+  fi
+  return 0
+}
+
+# lspci knows the marketing name ("[Radeon RX 6750 XT]") and sysfs does not, so
+# when lspci is installed the report says something a person recognises.
+lspci_name_for() {
+  local ids="$1" line desc
+  [ -n "$LSPCI_CACHE" ] || return 1
+  while IFS= read -r line; do
+    case "$line" in
+      *"[$ids]"*) ;;
+      *) continue ;;
+    esac
+    desc="${line#*: }"
+    desc="${desc%% \[${ids}\]*}"
+    printf '%s' "$desc"
+    return 0
+  done <<< "$LSPCI_CACHE"
+  return 1
+}
+
+scan_cards() {
+  local card base vendor devid driver ids name
+  CARD_LINES=()
+  for card in /sys/class/drm/card[0-9]*; do
+    [ -d "$card" ] || continue
+    base="${card##*/}"
+    # card0-eDP-1 is a connector; only card0 is the GPU.
+    case "$base" in *-*) continue ;; esac
+    [ -r "$card/device/vendor" ] || continue
+    vendor="$(cat "$card/device/vendor" 2>/dev/null || printf '')"
+    devid="$(cat "$card/device/device" 2>/dev/null || printf '')"
+    driver=""
+    if [ -e "$card/device/driver" ]; then
+      driver="$(basename "$(readlink -f "$card/device/driver" 2>/dev/null || printf '')")"
+    fi
+    ids="${vendor#0x}:${devid#0x}"
+    lspci_cache
+    name="$(lspci_name_for "$ids" || printf '')"
+    [ -n "$name" ] || name="$(vendor_pretty "$vendor") GPU"
+    CARD_LINES+=("${base}|${vendor}|${devid}|${driver}|${name}")
+  done
+  return 0
+}
+
+# --- checks -------------------------------------------------------------------
+check_kernel() {
+  local rel fam
+  rel="$(uname -r 2>/dev/null || printf 'unknown')"
+  fam="$(continuity_family)"
+  if [ "$fam" != "arch" ]; then
+    # linux-zen is an Arch packaging choice; a Fedora or Debian kernel is not a
+    # problem just because it is not called -zen.
+    record kernel SKIP "$rel ($fam — the linux-zen preference is Arch-specific)"
+    return 0
+  fi
+  case "$rel" in
+    *-zen*)
+      record kernel PASS "$rel"
+      ;;
+    *)
+      record kernel WARN "$rel is not a -zen kernel" \
+        "sudo ./install.sh --system   (then pick 'Arch Linux (linux-zen)' in your bootloader and reboot)"
+      ;;
+  esac
+  return 0
+}
+
+check_multilib() {
+  local fam conf=/etc/pacman.conf line trimmed enabled=0 out
+  fam="$(continuity_family)"
+  case "$fam" in
+    arch)
+      if [ ! -r "$conf" ]; then
+        record multilib SKIP "$conf is not readable"
+        return 0
+      fi
+      while IFS= read -r line || [ -n "$line" ]; do
+        trimmed="${line//[[:space:]]/}"
+        case "$trimmed" in
+          '['multilib']') enabled=1 ;;
+        esac
+      done <"$conf"
+      if [ "$enabled" = "1" ]; then
+        record multilib PASS "the [multilib] repository is enabled"
+      else
+        record multilib FAIL "the [multilib] repository is disabled — no 32-bit package can be installed" \
+          "sudo ./install.sh --system"
+      fi
+      ;;
+    debian)
+      # On Debian/Ubuntu "multilib" is the i386 foreign architecture.
+      if ! continuity_have dpkg; then
+        record multilib SKIP "dpkg is not available, so the 32-bit architecture cannot be read"
+        return 0
+      fi
+      out="$(dpkg --print-foreign-architectures 2>/dev/null || printf '')"
+      case " $out " in
+        *" i386 "*)
+          record multilib PASS "the i386 foreign architecture is enabled"
+          ;;
+        *)
+          record multilib FAIL "32-bit (i386) packages are not enabled — 32-bit Windows games cannot start" \
+            "sudo dpkg --add-architecture i386 && sudo apt update"
+          ;;
+      esac
+      ;;
+    fedora)
+      record multilib SKIP "Fedora installs multilib on demand; the 32-bit checks below decide"
+      ;;
+    *)
+      record multilib SKIP "no multilib concept on this distribution"
+      ;;
+  esac
+  return 0
+}
+
+check_gpu() {
+  local entry base vendor devid driver name detail="" n=0 first_kind=""
+  [ "${#CARD_LINES[@]}" -gt 0 ] || scan_cards
+  for entry in "${CARD_LINES[@]}"; do
+    IFS='|' read -r base vendor devid driver name <<<"$entry"
+    n=$((n+1))
+    if [ -z "$first_kind" ]; then first_kind="$(vendor_kind "$vendor")"; fi
+    detail="${detail}${detail:+; }${name}"
+    if [ -n "$driver" ]; then detail="${detail} (driver ${driver})"; fi
+    if [ -n "$devid" ]; then detail="${detail} [${vendor#0x}:${devid#0x}]"; fi
+  done
+  if [ "$n" -eq 0 ]; then
+    record gpu FAIL "no DRM graphics device found under /sys/class/drm"
+    return 0
+  fi
+  VENDOR_KIND="$first_kind"
+  record gpu PASS "$detail"
+  return 0
+}
+
+check_drm() {
+  local entry base vendor devid driver name found="" nouveau=0
+  for entry in "${CARD_LINES[@]}"; do
+    IFS='|' read -r base vendor devid driver name <<<"$entry"
+    [ -n "$driver" ] || continue
+    if [ -d "/sys/module/$driver" ]; then
+      found="${found}${found:+, }$driver"
+      [ "$driver" = "nouveau" ] && nouveau=1
+    fi
+  done
+  if [ -z "$found" ]; then
+    case "$VENDOR_KIND" in
+      nvidia) record drm FAIL "no DRM kernel driver is loaded for the NVIDIA GPU" \
+                "$(continuity_pkg_command nvidia-dkms 2>/dev/null || printf 'install the NVIDIA kernel driver')" ;;
+      amd)    record drm FAIL "no DRM kernel driver is loaded for the AMD GPU" \
+                "$(continuity_pkg_command gpu-driver-amd 2>/dev/null || printf 'install the amdgpu kernel driver and its firmware')" ;;
+      intel)  record drm FAIL "no DRM kernel driver is loaded for the Intel GPU" \
+                "$(continuity_pkg_command gpu-driver-intel 2>/dev/null || printf 'install the i915 kernel driver and its firmware')" ;;
+      *)      record drm FAIL "no DRM kernel driver is loaded"
+              ;;
+    esac
+    return 0
+  fi
+  if [ "$nouveau" = "1" ]; then
+    record drm WARN "nouveau is driving the NVIDIA GPU ($found)" \
+      "$(continuity_pkg_command nvidia-dkms 2>/dev/null || printf 'install the NVIDIA kernel driver')   (nouveau is fine for the desktop, but not for games)"
+    return 0
+  fi
+  record drm PASS "$found"
+  return 0
+}
+
+check_vulkan() {
+  local kind="$VENDOR_KIND" out name driver api av_major av_minor rest
+  if ! continuity_have vulkaninfo; then
+    record vulkan FAIL "vulkaninfo is not installed, so Vulkan cannot be verified" "$(vulkan_fix "$kind")"
+    return 0
+  fi
+  out="$(run_capped 20 vulkaninfo --summary 2>/dev/null || printf '')"
+  name="$(vfield "$out" deviceName)"
+  driver="$(vfield "$out" driverInfo)"
+  [ -n "$driver" ] || driver="$(vfield "$out" driverName)"
+  api="$(vfield "$out" apiVersion)"
+  if [ -z "$name" ] && [ -z "$driver" ]; then
+    record vulkan FAIL "vulkaninfo could not enumerate a Vulkan device" "$(vulkan_fix "$kind")"
+    return 0
+  fi
+
+  # Vulkan 1.2 is the floor for anything DXVK/vkd3d based; below it, games fail
+  # in ways that look like a game bug rather than a driver problem.
+  if [ -n "$api" ]; then
+    av_major="${api%%.*}"
+    rest="${api#*.}"
+    av_minor="${rest%%.*}"
+    case "$av_major" in ''|*[!0-9]*) av_major="" ;; esac
+    case "$av_minor" in ''|*[!0-9]*) av_minor="" ;; esac
+    if [ -n "$av_major" ] && [ -n "$av_minor" ] && \
+       { [ "$av_major" -lt 1 ] || { [ "$av_major" -eq 1 ] && [ "$av_minor" -lt 2 ]; }; }; then
+      record vulkan WARN "${name:-Vulkan device} — driver ${driver:-unknown}, Vulkan $api is older than the 1.2 that Proton needs" \
+        "$(vulkan_fix "$kind")"
+      return 0
+    fi
+  fi
+  record vulkan PASS "${name:-Vulkan device} — ${driver:-unknown driver}${api:+, Vulkan $api}"
+  return 0
+}
+
+check_vulkan32() {
+  local arch="$1" kind="$VENDOR_KIND" lib32=0 icd32=0 any32=0 f libdir detail="" logicals fix
+  if [ "$arch" != "x86_64" ]; then
+    record vulkan32 SKIP "not x86_64 ($arch) — 32-bit game support is an x86_64 concern"
+    return 0
+  fi
+  # The 32-bit tree is not /usr/lib32 everywhere: Arch keeps it there, Debian
+  # multiarch uses /usr/lib/i386-linux-gnu and Fedora mixes it into /usr/lib. Ask
+  # the shared library where to look rather than assuming one layout.
+  while IFS= read -r libdir; do
+    [ -n "$libdir" ] || continue
+    any32=1
+    if [ -e "$libdir/libvulkan.so.1" ]; then lib32=1; fi
+    # A 32-bit ICD is a driver library installed beside the 32-bit loader. Reading
+    # the real files beats parsing ICD JSON, whose paths differ per distribution.
+    for f in "$libdir"/libvulkan_*.so* "$libdir"/libGLX_nvidia.so*; do
+      if [ -e "$f" ]; then icd32=1; fi
+    done
+  done < <(continuity_lib32_dirs)
+
+  case "$kind" in
+    amd)    logicals="vulkan-loader32 vulkan-amd32 mesa32" ;;
+    intel)  logicals="vulkan-loader32 vulkan-intel32 mesa32" ;;
+    nvidia) logicals="vulkan-loader32 nvidia32" ;;
+    *)      logicals="vulkan-loader32 mesa32" ;;
+  esac
+  # shellcheck disable=SC2086
+  fix="$(continuity_pkg_command $logicals 2>/dev/null || printf 'install the 32-bit Vulkan loader and driver')"
+
+  if [ "$any32" = "0" ]; then
+    record vulkan32 FAIL "no 32-bit userspace was found — 32-bit Windows games cannot start" "$fix"
+    return 0
+  fi
+  if [ "$lib32" = "0" ]; then detail="the 32-bit Vulkan loader is missing"; fi
+  if [ "$icd32" = "0" ]; then detail="${detail}${detail:+; }no 32-bit Vulkan driver is installed"; fi
+  if [ -n "$detail" ]; then
+    record vulkan32 FAIL "$detail — 64-bit games will run while 32-bit ones fail with a misleading error" "$fix"
+    return 0
+  fi
+  record vulkan32 PASS "32-bit Vulkan loader and driver are both installed"
+  return 0
+}
+
+check_gl32() {
+  local arch="$1" detail="" libdir found=0 egl=0 fix
+  if [ "$arch" != "x86_64" ]; then
+    record gl32 SKIP "not x86_64 ($arch)"
+    return 0
+  fi
+  while IFS= read -r libdir; do
+    [ -n "$libdir" ] || continue
+    if [ -e "$libdir/libGL.so.1" ]; then found=1; fi
+    if [ -e "$libdir/libEGL.so.1" ]; then egl=1; fi
+  done < <(continuity_lib32_dirs)
+  if [ "$found" = "1" ]; then
+    record gl32 PASS "32-bit OpenGL is installed"
+    return 0
+  fi
+  fix="$(continuity_pkg_command gl32 2>/dev/null || printf 'install the 32-bit Mesa OpenGL libraries')"
+  detail="32-bit libGL.so.1 is missing"
+  if [ "$egl" = "1" ]; then
+    detail="$detail (32-bit EGL is present, so only older games are affected)"
+  fi
+  record gl32 WARN "$detail" "$fix"
+  return 0
+}
+
+check_wine() {
+  local out version
+  if ! continuity_have wine; then
+    record wine WARN "wine is not installed — .msi installers and .lnk shortcuts need it" \
+      "$(continuity_pkg_command wine wine32 2>/dev/null || printf 'install wine from your distribution')"
+    return 0
+  fi
+  out="$(run_capped 15 wine --version 2>/dev/null || printf '')"
+  version="$(printf '%s' "$out" | tr -d '\r\n')"
+  record wine PASS "${version:-wine} at $(command -v wine)"
+  return 0
+}
+
+check_umu() {
+  local out version
+  if ! continuity_have umu-run; then
+    record umu WARN "umu-run is not installed — the default engine (Proton outside Steam) cannot launch" \
+      "$(continuity_umu_hint)"
+    return 0
+  fi
+  out="$(run_capped 20 umu-run --version 2>/dev/null || printf '')"
+  version="$(printf '%s' "$out" | tr -d '\r' | head -n1)"
+  record umu PASS "${version:-umu-run} at $(command -v umu-run)"
+  return 0
+}
+
+check_proton() {
+  local proton
+  if proton="$(continuity_find_host_proton 2>/dev/null)"; then
+    record proton PASS "$proton/proton (direct host runner)"
+    return 0
+  fi
+  record proton WARN "no Valve Proton build found; install/launch Steam once and select a Proton version" \
+    "install Steam and a Proton build, then run continuity-run --print-env <file.exe>"
+  return 0
+}
+
+check_steam() {
+  if continuity_have steam; then
+    record steam PASS "$(command -v steam)"
+    return 0
+  fi
+  record steam WARN "Steam is not installed — install Steam to obtain Valve's host Proton build" \
+    "$(continuity_pkg_command steam 2>/dev/null || printf 'install Steam (Flathub: flatpak install flathub com.valvesoftware.Steam)')"
+  return 0
+}
+
+check_tools() {
+  local spec bin pkg present="" missing="" note="" fix
+  local logicals=()
+  for spec in gamescope:gamescope mangohud:mangohud gamemoderun:gamemode; do
+    bin="${spec%%:*}"
+    pkg="${spec#*:}"
+    if continuity_have "$bin"; then
+      present="${present}${present:+, }$pkg"
+    else
+      missing="${missing}${missing:+, }$pkg"
+      logicals+=("$pkg")
+    fi
+  done
+  if [ -z "$missing" ]; then
+    record tools PASS "$present"
+    return 0
+  fi
+  [ -n "$present" ] && note=" (present: $present)"
+  fix="$(continuity_pkg_command "${logicals[@]}" 2>/dev/null || printf 'install: %s' "$missing")"
+  record tools WARN "not installed: $missing$note — optional, the engine runs without them" "$fix"
+  return 0
+}
+
+check_governor() {
+  local gov_file=/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+  local avail_file=/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors
+  local gov avail have_perf=0
+  if [ ! -r "$gov_file" ]; then
+    record governor SKIP "no cpufreq interface (desktop CPU, VM, or driver-managed scaling)"
+    return 0
+  fi
+  gov="$(cat "$gov_file" 2>/dev/null || printf '')"
+  avail="$(cat "$avail_file" 2>/dev/null || printf '')"
+  case " $avail " in
+    *' performance '*) have_perf=1 ;;
+  esac
+  if [ "$gov" = "powersave" ] && [ "$have_perf" = "1" ]; then
+    record governor WARN "governor is powersave while performance is available" "continuity-gaming-mode on"
+    return 0
+  fi
+  if [ -z "$gov" ]; then
+    record governor SKIP "the governor could not be read"
+    return 0
+  fi
+  record governor PASS "governor: $gov"
+  return 0
+}
+
+check_memory() {
+  local kib gib whole
+  kib="$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo 2>/dev/null || printf '')"
+  if [ -z "$kib" ]; then
+    record memory SKIP "/proc/meminfo could not be read"
+    return 0
+  fi
+  gib="$(awk -v k="$kib" 'BEGIN { printf "%.1f", k / 1048576 }')"
+  whole="${gib%%.*}"
+  case "$whole" in ''|*[!0-9]*) whole=0 ;; esac
+  if [ "$whole" -lt 8 ]; then
+    record memory WARN "$gib GiB of RAM — modern Proton games want 8 GiB or more"
+    return 0
+  fi
+  record memory PASS "$gib GiB of RAM"
+  return 0
+}
+
+check_disk() {
+  local out avail_k total_k avail_gib total_gib
+  out="$(df -Pk "$PREFIX_ROOT" 2>/dev/null || printf '')"
+  if [ -z "$out" ]; then
+    record disk SKIP "free space at $PREFIX_ROOT could not be read"
+    return 0
+  fi
+  # END takes the data line whether or not df wrapped a long device name.
+  avail_k="$(printf '%s\n' "$out" | awk 'END { print $4 + 0 }')"
+  total_k="$(printf '%s\n' "$out" | awk 'END { print $2 + 0 }')"
+  avail_gib="$(awk -v k="$avail_k" 'BEGIN { printf "%.1f", k / 1048576 }')"
+  total_gib="$(awk -v k="$total_k" 'BEGIN { printf "%.1f", k / 1048576 }')"
+  if [ "$avail_k" -lt 5242880 ]; then
+    record disk WARN "$avail_gib GiB free of $total_gib GiB at $PREFIX_ROOT — a large prefix wants ~5 GiB per game"
+    return 0
+  fi
+  record disk PASS "$avail_gib GiB free of $total_gib GiB at $PREFIX_ROOT"
+  return 0
+}
+
+check_secureboot() {
+  local f val state=unknown
+  if [ ! -d /sys/firmware/efi ]; then
+    record secureboot SKIP "booted in legacy BIOS mode (no EFI variables)"
+    return 0
+  fi
+  for f in /sys/firmware/efi/efivars/SecureBoot-*; do
+    [ -r "$f" ] || continue
+    # The variable is (attrs:4 bytes)(value:1 byte): offset 4 is the flag itself.
+    val="$(od -An -t u1 -j 4 -N 1 "$f" 2>/dev/null | tr -dc '0-9' || printf '')"
+    case "$val" in
+      1) state=on ;;
+      0) state=off ;;
+    esac
+    break
+  done
+  case "$state" in
+    off) record secureboot PASS "Secure Boot is off" ;;
+    on)  record secureboot WARN "Secure Boot is on — unsigned DKMS modules (nvidia-dkms) will not load until their keys are enrolled with mokutil" ;;
+    *)   record secureboot SKIP "the SecureBoot EFI variable could not be read" ;;
+  esac
+  return 0
+}
+
+# --- the probe ----------------------------------------------------------------
+# rm -rf appears three times below, so the path is proved to be inside the prefix
+# root every single time: a typo here would delete a home directory.
+assert_probe_path() {
+  local dir="$1"
+  [ -n "$PREFIX_ROOT" ] || continuity_die "the prefix root is empty; refusing to touch anything"
+  [ "$PREFIX_ROOT" != "/" ] || continuity_die "the prefix root is /; refusing to touch anything"
+  case "$dir" in
+    "$PREFIX_ROOT"/?*) return 0 ;;
+    *) continuity_die "refusing to touch '$dir' (outside $PREFIX_ROOT)" ;;
+  esac
+}
+
+cmd_prune() {
+  local dir="$PROBE_DIR" leftover
+  assert_probe_path "$dir"
+  if [ -e "$dir" ]; then
+    rm -rf "$dir"
+    continuity_ok "removed the probe prefix $dir"
+  else
+    continuity_info "no probe prefix at $dir"
+  fi
+  # A probe killed mid-run can leave a lock beside or inside the prefix.
+  for leftover in "$dir".prefix.lock "$dir/.prefix.lock"; do
+    if [ -e "$leftover" ]; then
+      rm -f "$leftover"
+      continuity_info "removed the stale lock $leftover"
+    fi
+  done
+  return 0
+}
+
+run_probe() {
+  local dir="$PROBE_DIR" log rc=0 answer=0 proton=""
+  log="$CONTINUITY_STATE_DIR/shakedown-probe.log"
+  assert_probe_path "$dir"
+  continuity_ensure_dirs
+  rm -rf "$dir"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    record probe FAIL "the throwaway prefix could not be created at $dir (disk full or read-only?)"
+    return 0
+  fi
+
+  if ! continuity_have timeout; then
+    # Uncappable probes are how a wizard hangs forever on a black screen.
+    rm -rf "$dir"
+    record probe SKIP "coreutils timeout is unavailable, so a probe cannot be capped and was not run"
+    return 0
+  fi
+
+  if continuity_have wine; then
+    : >"$log" 2>/dev/null || true
+    # env(1) rather than a VAR=value prefix: a prefix on a function call is not
+    # reliably exported to the process the function starts.
+    if run_capped 180 env WINEPREFIX="$dir" wine cmd /c ver >>"$log" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+    # "Windows" appears in the banner wine's cmd prints; anything else means the
+    # program did not actually get to run.
+    if [ -r "$log" ] && grep -q 'Windows' "$log" 2>/dev/null; then
+      answer=1
+    fi
+    if [ "$answer" = "1" ]; then
+      record probe PASS "a real Windows program answered in a throwaway prefix (log: $log)"
+    elif [ "$rc" = "124" ] || [ "$rc" = "137" ]; then
+      record probe WARN "the probe hit the 180s cap — the Windows layer is very slow or stuck (log: $log)"
+    else
+      record probe FAIL "a Windows program could not run in a throwaway prefix (exit $rc, log: $log)"
+    fi
+  elif [ -n "$(continuity_find_host_proton 2>/dev/null || true)" ]; then
+    record probe WARN "host Proton is installed, but Wine is missing so the throwaway probe cannot run"
+  else
+    record probe SKIP "neither Wine nor a host Proton build is installed, so there is nothing to launch"
+  fi
+
+  if [ "${CONTINUITY_KEEP_PROBE:-0}" = "1" ]; then
+    continuity_info "keeping the probe prefix: $dir"
+  else
+    rm -rf "$dir"
+  fi
+  return 0
+}
+
+# --- run ----------------------------------------------------------------------
+if [ "$PRUNE" = "1" ]; then
+  cmd_prune
+  exit 0
+fi
+
+ARCH="$(uname -m 2>/dev/null || printf 'unknown')"
+scan_cards
+
+check_kernel
+check_multilib
+check_gpu
+check_drm
+check_vulkan
+check_vulkan32 "$ARCH"
+check_gl32 "$ARCH"
+check_wine
+check_umu
+check_proton
+check_steam
+check_tools
+check_governor
+check_memory
+check_disk
+check_secureboot
+if [ "$PROBE" = "1" ]; then
+  run_probe
+fi
+
+emit_results
+
+if [ "$(count_status FAIL)" -gt 0 ]; then
+  exit 1
+fi
+exit 0

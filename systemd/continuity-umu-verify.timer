@@ -1,0 +1,17 @@
+[Unit]
+Description=ContinuityOS: periodic Steam Linux Runtime validation
+Documentation=file:///usr/local/share/doc/continuityos/ARCHITECTURE.md
+Requires=continuity-umu-verify.service
+
+[Timer]
+# Validate once shortly after login (the seed unit has already repaired anything
+# it could), then keep an eye on it daily. Persistent=true means a machine that
+# was switched off all week still runs the check after the next boot.
+OnBootSec=5min
+OnUnitActiveSec=1d
+RandomizedDelaySec=15m
+Persistent=true
+Unit=continuity-umu-verify.service
+
+[Install]
+WantedBy=timers.target

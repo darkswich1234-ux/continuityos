@@ -1,0 +1,1462 @@
+#!/usr/bin/env bash
+# ContinuityOS — guided disk installation onto a real machine.
+#
+# This is the live medium's reason to exist: boot it, answer a handful of
+# questions, reboot into a ContinuityOS that already knows who you are.
+#
+#   continuity-installer disks     what disks this machine has
+#   continuity-installer plan …    generate the archinstall config and show it
+#   continuity-installer install … partition, install, deploy, verify
+#   continuity-installer ui        the graphical flow over the two above
+#   continuity-installer status    is this a live medium, is archinstall here
+#
+# THE DIVISION OF LABOUR is deliberate. archinstall does the part that must not
+# be improvised: partitioning, mkfs, the base system, the kernel, the
+# bootloader. Everything after that is done here — the new system is mounted, the
+# ContinuityOS payload is copied into it, and the repository's own install.sh
+# runs inside the target's chroot. So the package lists, the GPU detection and
+# the shell deployment live in exactly one place (install.sh); none of it is
+# duplicated into an archinstall config that would then drift.
+#
+# ARCHINSTALL VERSION RISK: its config schema is version-sensitive (upstream is
+# on 4.x; 3.x used `disk_config` / `config_type: manual_partitioning` /
+# `bootloader_config` / `locale_config` / `--creds`, and 2.x did not). A major
+# version other than KNOWN_ARCHINSTALL_MAJOR is warned about loudly instead of
+# quietly trusted, and `plan` exists precisely so the generated JSON can be
+# inspected on a machine nobody is about to wipe.
+#
+# SAFETY: every disk-choosing path refuses a partition, a removable disk, a disk
+# with anything mounted on it, and the medium this script is running from. The
+# erase happens only after the device name has been typed back — or with --yes
+# *together with* an explicitly unattended boot command line.
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-installer: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+continuity_load_env
+
+PAYLOAD_DIR="${CONTINUITY_PAYLOAD_DIR:-/opt/continuityos}"
+LOG_FILE="${CONTINUITY_INSTALLER_LOG:-/var/log/continuity-installer.log}"
+MOUNT_ROOT="${CONTINUITY_MOUNT_ROOT:-/mnt}"
+MIN_DISK_GIB=20
+ESP_MIB=512
+# The archinstall major version whose config field names are written below.
+KNOWN_ARCHINSTALL_MAJOR=3
+# Kernel flavour this medium ships; the boot stanzas and the target agree on it.
+TARGET_KERNEL=linux-zen
+
+# Everything the target needs to run install.sh at all. The desktop, the gaming
+# stack and the 32-bit libraries are NOT here: install.sh installs those from
+# packages/*.list, with the GPU detection it already has.
+TARGET_PACKAGES=(
+  base "$TARGET_KERNEL" "${TARGET_KERNEL}-headers" linux-firmware mkinitcpio
+  networkmanager iwd sudo git rsync
+  nano less which pciutils usbutils man-db openssh
+)
+
+PLAN_ACTION=""
+PLAN_DISK=""
+PLAN_USER=""
+PLAN_HOST=""
+PLAN_TZ=""
+PLAN_LOCALE=""
+PLAN_KEYMAP="us"
+PLAN_FS="ext4"
+PLAN_OUT=""
+PLAN_PASSWORD_FILE=""
+PLAN_LOG="$LOG_FILE"
+PLAN_YES=0
+PLAN_DRY=0
+PLAN_VALIDATE=0
+PLAN_ALLOW_REMOVABLE=0
+DISK_ARGS=0
+
+# Test seams. Everything below goes through these two so `plan` can be exercised
+# against a fixture tree on a machine with no spare disk and no root: point
+# CONTINUITY_INSTALLER_SYSBLOCK at a directory of fake block devices and
+# CONTINUITY_INSTALLER_LSBLK at a stub, exactly the way continuity-region lets
+# its own tooling be pointed at stubs.
+SYS_BLOCK="${CONTINUITY_INSTALLER_SYSBLOCK:-/sys/block}"
+LSBLK_BIN="${CONTINUITY_INSTALLER_LSBLK:-lsblk}"
+
+usage() {
+  cat <<EOF
+ContinuityOS installer — put this OS on a disk
+
+USAGE
+  $PROG disks
+  $PROG plan    --disk DEV --user NAME --host NAME --timezone TZ --locale L [OPTIONS]
+  $PROG install --disk DEV --user NAME --host NAME --timezone TZ --locale L [OPTIONS]
+  $PROG ui
+  $PROG status
+  $PROG --help
+
+COMMANDS
+  disks     one row per candidate disk: device, size, model, removable, in use
+  plan      write install-config.json (and creds.json) into --out and print the
+            whole plan. Reads the disk, writes nothing outside --out, needs no
+            root — this is the part you can look at before trusting it.
+  install   partition the disk, install Arch, then deploy ContinuityOS into it
+            and verify what actually landed. Needs root; asks for confirmation.
+  ui        the graphical flow: disk, names, password, timezone, locale, a typed
+            confirmation, then progress. Falls back to terminal prompts.
+  status    whether this is a live medium, the archinstall version, the payload,
+            and any previous install log.
+
+REQUIRED (install/plan)
+  --disk DEV       whole disk, e.g. /dev/nvme0n1. The whole thing is erased.
+  --user NAME      the account you will log in as (not root)
+  --host NAME      hostname
+  --timezone TZ    e.g. Europe/London (must exist in the zoneinfo database)
+  --locale L       e.g. en_GB.UTF-8
+
+OPTIONS
+  --keymap K       console/keyboard layout (default: us)
+  --fs ext4|btrfs  root filesystem (default: ext4)
+  --password-file F   read the account password from F (0600). Without it, and
+                      without a terminal to prompt on, the install is refused.
+  --out DIR        where plan writes its files (default: \$HOME/.local/state/continuity/installer)
+  --log FILE       install log (default: $LOG_FILE)
+  --dry-run        with plan: print the JSON and write nothing
+  --validate       with plan: additionally ask archinstall to parse the config
+                   (a limited preflight, not a proof)
+  --allow-removable   permit a removable disk as the target (refused by default)
+  -y, --yes        do not prompt — still refused unless the boot command line
+                   says continuityos.disk=, i.e. someone asked for this unattended
+  -h, --help       this help
+
+WHAT IT DOES NOT DO
+  * No encryption, no LVM, no dual boot, no BIOS installs: the generated layout
+    is UEFI + a 512 MiB ESP at /boot + one ext4 (or btrfs) root taking the rest
+    of the disk. There is no way to keep another OS on the disk it is pointed at.
+  * Nothing is copied from a previous installation. Files you care about belong
+    somewhere else before this runs.
+EOF
+}
+
+say()  { printf '%s==>%s %s\n' "$_c_blu" "$_c_reset" "$*" >&2; }
+ok()   { printf '%s  ok%s %s\n' "$_c_grn" "$_c_reset" "$*" >&2; }
+warn() { printf '%s  !!%s %s\n' "$_c_ylw" "$_c_reset" "$*" >&2; }
+die2() { printf '%serror:%s %s\n' "$_c_red" "$_c_reset" "$*" >&2; exit 1; }
+# The shared library's die() is exit 1; usage problems are exit 2 by contract.
+usage_error() { printf '%s: %s\n' "$PROG" "$*" >&2; usage >&2; exit 2; }
+
+have() { continuity_have "$1"; }
+
+# ---------------------------------------------------------------------------
+# disk introspection — no root, no side effects, no lsblk columns guessed twice
+# ---------------------------------------------------------------------------
+# Bytes on the device without needing root: /sys/block/<name>/size is in sectors
+# and world-readable, whereas blockdev(8) wants access to the device node.
+disk_bytes() {
+  local dev="$1" name sectors
+  name="$(basename -- "$dev")"
+  if [ -r "$SYS_BLOCK/$name/size" ]; then
+    sectors="$(cat "$SYS_BLOCK/$name/size" 2>/dev/null || echo)"
+    case "$sectors" in
+      ''|*[!0-9]*) ;;
+      *) printf '%s' "$(( sectors * 512 ))"; return 0 ;;
+    esac
+  fi
+  if have blockdev; then
+    local b
+    b="$(blockdev --getsize64 "$dev" 2>/dev/null || true)"
+    if [ -n "$b" ]; then printf '%s' "$b"; return 0; fi
+  fi
+  if have "$LSBLK_BIN"; then
+    local l
+    l="$("$LSBLK_BIN" -bndo SIZE "$dev" 2>/dev/null | sed -n '1p')"
+    if [ -n "$l" ]; then printf '%s' "$l"; return 0; fi
+  fi
+  return 1
+}
+
+disk_logical_sector() {
+  local dev="$1" name val
+  name="$(basename -- "$dev")"
+  val="$(cat "$SYS_BLOCK/$name/queue/logical_block_size" 2>/dev/null || true)"
+  case "$val" in ''|*[!0-9]*) val=512 ;; esac
+  printf '%s' "$val"
+}
+
+bytes_to_gib() { awk -v b="${1:-0}" 'BEGIN { printf "%.1f", b / 1073741824 }'; }
+
+disk_size_human() {
+  local b
+  b="$(disk_bytes "$1" 2>/dev/null || echo 0)"
+  printf '%s GiB' "$(bytes_to_gib "$b")"
+}
+
+# /dev/sda1 -> /dev/sda ; /dev/nvme0n1p2 -> /dev/nvme0n1 ; /dev/mmcblk0p1 -> /dev/mmcblk0
+parent_disk_of() {
+  local path="$1" base
+  base="$(basename -- "$path")"
+  case "$base" in
+    # Anything else (LVM, md, dm-crypt) has no whole-disk parent we can point
+    # archinstall at, so it is returned unchanged and the caller refuses it.
+    nvme*n*|mmcblk*|md*)
+      case "$base" in
+        *p[0-9]*) printf '/dev/%s' "$(printf '%s' "$base" | sed -E 's/p[0-9]+$//')" ;;
+        *) printf '/dev/%s' "$base" ;;
+      esac
+      ;;
+    sd[a-z]*|hd[a-z]*|vd[a-z]*)
+      printf '/dev/%s' "$(printf '%s' "$base" | sed -E 's/[0-9]+$//')"
+      ;;
+    *) printf '/dev/%s' "$base" ;;
+  esac
+}
+
+disk_model() {
+  local dev="$1" name model
+  name="$(basename -- "$dev")"
+  model="$(cat "$SYS_BLOCK/$name/device/model" 2>/dev/null || true)"
+  if [ -z "$model" ] && have "$LSBLK_BIN"; then
+    model="$("$LSBLK_BIN" -ndo MODEL "$dev" 2>/dev/null | sed -n '1p')"
+  fi
+  printf '%s' "$(printf '%s' "$model" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+}
+
+disk_is_removable() {
+  local dev="$1" name rm
+  name="$(basename -- "$dev")"
+  rm="$(cat "$SYS_BLOCK/$name/removable" 2>/dev/null || true)"
+  [ "$rm" = "1" ]
+}
+
+# Anything mounted from this disk means the disk is in use — and on a live medium
+# that includes the medium itself, which is the one disk we must never offer.
+disk_in_use() {
+  local dev="$1" found
+  have "$LSBLK_BIN" || return 1
+  found="$("$LSBLK_BIN" -pnrlo NAME,MOUNTPOINT "$dev" 2>/dev/null | awk '$2 != "" {print $1}' | sed -n '1p')"
+  [ -n "$found" ] && return 0
+  if have swapon; then
+    found="$(swapon --show=NAME --noheadings 2>/dev/null | sed -e 's/^[[:space:]]*//' || true)"
+    [ -n "$found" ] || return 1
+    local p
+    while IFS= read -r p; do
+      case "$p" in "$dev"*|"$(parent_disk_of "$p")") return 0 ;; esac
+    done <<<"$found"
+  fi
+  return 1
+}
+
+disk_kind() {
+  local dev="$1" kind
+  have "$LSBLK_BIN" || { printf 'unknown'; return 0; }
+  kind="$("$LSBLK_BIN" -ndo TYPE "$dev" 2>/dev/null | sed -n '1p')"
+  printf '%s' "${kind:-unknown}"
+}
+
+# The device the running system lives on. On a live medium that is the stick or
+# the ISO, and pointing the installer at it would destroy itself mid-install.
+running_device() {
+  local src
+  if have findmnt; then
+    # /run/archiso/bootmnt is the medium itself (ISO file or USB stick); the root
+    # of a live system is an overlay and tells us nothing.
+    src="$(findmnt -rno SOURCE /run/archiso/bootmnt 2>/dev/null | sed -n '1p' || true)"
+    [ -n "$src" ] || src="$(findmnt -rno SOURCE / 2>/dev/null | sed -n '1p' || true)"
+    case "$src" in
+      /dev/*) parent_disk_of "$src"; return 0 ;;
+    esac
+  fi
+  printf ''
+}
+
+is_live_medium() {
+  [ -e /run/archiso ] && { printf 'yes'; return 0; }
+  case "$(cat /proc/cmdline 2>/dev/null || true)" in
+    *archisobasedir=*) printf 'yes' ;;
+    *) printf 'no' ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# validation
+# ---------------------------------------------------------------------------
+valid_username() {
+  case "${1:-}" in
+    ''|root|nobody|daemon|bin|systemd-*) return 1 ;;
+  esac
+  printf '%s' "$1" | grep -qE '^[a-z_][a-z0-9_-]{0,31}$'
+}
+
+valid_hostname() {
+  local h="${1:-}"
+  [ -n "$h" ] && [ "${#h}" -le 63 ] || return 1
+  printf '%s' "$h" | grep -qE '^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$'
+}
+
+valid_locale() {
+  printf '%s' "${1:-}" | grep -qE '^[a-z]{2,3}(_[A-Z]{2})?(\.[A-Za-z0-9-]+)?(@[a-zA-Z0-9-]+)?$'
+}
+
+valid_keymap() {
+  printf '%s' "${1:-}" | grep -qE '^[a-z0-9][a-z0-9_-]*$'
+}
+
+valid_timezone() {
+  local tz="${1:-}" zone
+  [ -n "$tz" ] || return 1
+  case "$tz" in /*|*..*) return 1 ;; esac
+  for zone in /usr/share/zoneinfo /etc/zoneinfo /usr/lib/zoneinfo; do
+    [ -e "$zone/$tz" ] && return 0
+  done
+  # A live medium without tzdata is not a reason to refuse a plan whose JSON
+  # someone will read; the syntax check is what we can guarantee everywhere.
+  printf '%s' "$tz" | grep -qE '^[A-Za-z]+(_[A-Za-z]+)*(/[A-Za-z0-9_+-]+)+$'
+}
+
+# ---------------------------------------------------------------------------
+# JSON (hand-built, exactly like bin/continuity-wizard: no jq, no python needed)
+# ---------------------------------------------------------------------------
+json_escape() {
+  local s="$1"
+  s="${s//\\/\\\\}"
+  s="${s//\"/\\\"}"
+  s="${s//$'\n'/ }"
+  s="${s//$'\t'/ }"
+  printf '%s' "$s"
+}
+
+json_str() { printf '"%s"' "$(json_escape "$1")"; }
+
+json_pkg_list() {
+  local p first=1
+  for p in "${TARGET_PACKAGES[@]}"; do
+    [ "$first" = "1" ] || printf ', '
+    first=0
+    json_str "$p"
+  done
+}
+
+json_size() { printf '{"value": %s, "unit": "%s", "sector_size": {"value": %s, "unit": "B"}}' "$1" "$2" "$3"; }
+
+write_config_json() {
+  local file="$1" sector="$2" esp_start="$3" root_start="$4" root_size="$5"
+  {
+    printf '{\n'
+    printf '  "script": "guided",\n'
+    printf '  "hostname": %s,\n' "$(json_str "$PLAN_HOST")"
+    printf '  "kernels": [%s],\n' "$(json_str "$TARGET_KERNEL")"
+    printf '  "timezone": %s,\n' "$(json_str "$PLAN_TZ")"
+    printf '  "locale_config": {"kb_layout": %s, "sys_lang": %s, "sys_enc": "UTF-8"},\n' \
+      "$(json_str "$PLAN_KEYMAP")" "$(json_str "$PLAN_LOCALE")"
+    printf '  "packages": [%s],\n' "$(json_pkg_list)"
+    printf '  "bootloader_config": {"bootloader": "Systemd-boot", "uki": false, "removable": false},\n'
+    printf '  "disk_config": {\n'
+    printf '    "config_type": "manual_partitioning",\n'
+    printf '    "device_modifications": [\n'
+    printf '      {\n'
+    printf '        "device": %s,\n' "$(json_str "$PLAN_DISK")"
+    printf '        "wipe": true,\n'
+    printf '        "partitions": [\n'
+    # ESP. fat32 at /boot with the boot flag is what systemd-boot expects.
+    printf '          {\n'
+    printf '            "obj_id": "esp",\n'
+    printf '            "status": "create",\n'
+    printf '            "type": "primary",\n'
+    printf '            "start": %s,\n' "$(json_size "$esp_start" MiB "$sector")"
+    printf '            "size": %s,\n' "$(json_size "$ESP_MIB" MiB "$sector")"
+    printf '            "fs_type": "fat32",\n'
+    printf '            "mountpoint": "/boot",\n'
+    printf '            "mount_options": [],\n'
+    printf '            "flags": ["boot"],\n'
+    printf '            "btrfs": [],\n'
+    printf '            "dev_path": null\n'
+    printf '          },\n'
+    # Root. btrfs carries its mountpoint on the @ subvolume, not the partition.
+    printf '          {\n'
+    printf '            "obj_id": "root",\n'
+    printf '            "status": "create",\n'
+    printf '            "type": "primary",\n'
+    printf '            "start": %s,\n' "$(json_size "$root_start" MiB "$sector")"
+    printf '            "size": %s,\n' "$(json_size "$root_size" MiB "$sector")"
+    printf '            "fs_type": %s,\n' "$(json_str "$PLAN_FS")"
+    if [ "$PLAN_FS" = "btrfs" ]; then
+      printf '            "mountpoint": null,\n'
+      printf '            "mount_options": ["compress=zstd", "noatime"],\n'
+      printf '            "flags": [],\n'
+      printf '            "btrfs": [{"name": "@", "mountpoint": "/"}],\n'
+    else
+      printf '            "mountpoint": "/",\n'
+      printf '            "mount_options": [],\n'
+      printf '            "flags": [],\n'
+      printf '            "btrfs": [],\n'
+    fi
+    printf '            "dev_path": null\n'
+    printf '          }\n'
+    printf '        ]\n'
+    printf '      }\n'
+    printf '    ]\n'
+    printf '  }\n'
+    printf '}\n'
+  } >"$file"
+}
+
+# ---------------------------------------------------------------------------
+# the account password
+# ---------------------------------------------------------------------------
+# The password has to end up as a hash, not as a string we pass around. openssl
+# can produce a SHA-512 crypt; python3's crypt module can too, but only up to
+# 3.12 (it was removed in 3.13), so it is the fallback rather than the default.
+# When neither is available archinstall's deprecated plaintext key is the only
+# way through — and that is announced, not hidden.
+PASSWORD_KEY="enc_password"
+PASSWORD_VALUE=""
+
+hash_password() {
+  local pw="$1" out=""
+  if have openssl; then
+    out="$(printf '%s' "$pw" | openssl passwd -6 -stdin 2>/dev/null || true)"
+  fi
+  if [ -z "$out" ] && have python3; then
+    out="$(printf '%s' "$pw" | python3 -c \
+      'import crypt,sys; print(crypt.crypt(sys.stdin.read(), crypt.mksalt(crypt.METHOD_SHA512)))' \
+      2>/dev/null || true)"
+  fi
+  printf '%s' "$out"
+}
+
+# Load the password into PASSWORD_KEY/PASSWORD_VALUE. Never logs it, never puts
+# it in argv (argv is world-readable via /proc), and never writes a copy that
+# outlives the install.
+resolve_password() {
+  local pw="" pw2="" hash=""
+  if [ -n "$PLAN_PASSWORD_FILE" ]; then
+    [ -r "$PLAN_PASSWORD_FILE" ] || die2 "cannot read the password file: $PLAN_PASSWORD_FILE"
+    pw="$(sed -n '1p' "$PLAN_PASSWORD_FILE")"
+    if [ "$(stat -c '%a' "$PLAN_PASSWORD_FILE" 2>/dev/null || echo '') = '644'" ]; then
+      warn "$PLAN_PASSWORD_FILE is world-readable — remove it after this install"
+    fi
+  else
+    if [ ! -t 0 ]; then
+      die2 "no password available: pass --password-file FILE, or run install where it can prompt (an unattended install must be given one)"
+    fi
+    printf 'Password for %s: ' "$PLAN_USER" >&2
+    read -rs pw || pw=""
+    printf '\n' >&2
+    printf 'Repeat it: ' >&2
+    read -rs pw2 || pw2=""
+    printf '\n' >&2
+    [ "$pw" = "$pw2" ] || die2 "the passwords do not match"
+  fi
+  [ -n "$pw" ] || die2 "an empty password would leave '$PLAN_USER' unable to run sudo"
+  hash="$(hash_password "$pw")"
+  if [ -n "$hash" ]; then
+    PASSWORD_KEY="enc_password"
+    PASSWORD_VALUE="$hash"
+  else
+    PASSWORD_KEY="!password"
+    PASSWORD_VALUE="$pw"
+    warn "no openssl or python3 available to hash the password — writing archinstall's"
+    warn "deprecated plaintext key into a 0600 credential file that is deleted afterwards"
+  fi
+  unset pw pw2
+}
+
+write_creds_json() {
+  local file="$1"
+  {
+    printf '{\n'
+    printf '  "users": [\n'
+    printf '    {\n'
+    printf '      "username": %s,\n' "$(json_str "$PLAN_USER")"
+    printf '      %s: %s,\n' "$(json_str "$PASSWORD_KEY")" "$(json_str "$PASSWORD_VALUE")"
+    printf '      "sudo": true,\n'
+    # Standard Arch groups, all of them from the `filesystem` package, so this
+    # cannot name a group that does not exist in the target.
+    printf '      "groups": ["wheel", "video", "render", "audio", "input"]\n'
+    printf '    }\n'
+    printf '  ]\n'
+    printf '}\n'
+  } >"$file"
+  chmod 600 "$file" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# argument validation
+# ---------------------------------------------------------------------------
+require_plan_args() {
+  [ -n "$PLAN_DISK" ]  || usage_error "--disk is required (see --help)"
+  [ -n "$PLAN_USER" ]  || usage_error "--user is required (see --help)"
+  [ -n "$PLAN_HOST" ]  || usage_error "--host is required (see --help)"
+  [ -n "$PLAN_TZ" ]    || usage_error "--timezone is required (see --help)"
+  [ -n "$PLAN_LOCALE" ]|| usage_error "--locale is required (see --help)"
+}
+
+validate_values_or_die() {
+  valid_username "$PLAN_USER" || die2 "'$PLAN_USER' is not a usable account name (lowercase, no root)"
+  valid_hostname "$PLAN_HOST" || die2 "'$PLAN_HOST' is not a valid hostname"
+  valid_locale "$PLAN_LOCALE" || die2 "'$PLAN_LOCALE' is not a valid locale (try en_GB.UTF-8)"
+  valid_keymap "$PLAN_KEYMAP" || die2 "'$PLAN_KEYMAP' is not a valid keymap name"
+  valid_timezone "$PLAN_TZ" || die2 "'$PLAN_TZ' does not look like an IANA timezone (try Europe/London)"
+  case "$PLAN_FS" in
+    ext4|btrfs) ;;
+    *) usage_error "--fs must be ext4 or btrfs (got '$PLAN_FS')" ;;
+  esac
+}
+
+# Every refusal here is one that would otherwise be discovered by a machine that
+# no longer boots.
+validate_disk_or_die() {
+  case "$PLAN_DISK" in
+    /dev/*) ;;
+    *) die2 "--disk must be a device node such as /dev/nvme0n1 (got '$PLAN_DISK')" ;;
+  esac
+  # A device node is the normal case. When the sysfs seam is in use the fixture
+  # tree is the authority instead, so `plan` can be exercised — and reviewed — on
+  # a machine with no spare disk and no root.
+  if [ "$SYS_BLOCK" = "/sys/block" ]; then
+    [ -e "$PLAN_DISK" ] || die2 "no such device: $PLAN_DISK"
+  else
+    [ -s "$SYS_BLOCK/$(basename -- "$PLAN_DISK")/size" ] || die2 "no such device: $PLAN_DISK"
+  fi
+  local kind running bytes gib
+  kind="$(disk_kind "$PLAN_DISK")"
+  if [ "$kind" != "disk" ]; then
+    die2 "$PLAN_DISK is a '$kind', not a whole disk — a partition cannot be the target"
+  fi
+  running="$(running_device)"
+  if [ -n "$running" ] && [ "$running" = "$PLAN_DISK" ]; then
+    die2 "$PLAN_DISK is the disk this system is running from — writing to it would erase the medium mid-install"
+  fi
+  if disk_in_use "$PLAN_DISK"; then
+    die2 "$PLAN_DISK has filesystems in use (mounted, or in swap) — unmount them or pick another disk"
+  fi
+  if disk_is_removable "$PLAN_DISK" && [ "$PLAN_ALLOW_REMOVABLE" != "1" ]; then
+    die2 "$PLAN_DISK is removable — pass --allow-removable if that is deliberate"
+  fi
+  bytes="$(disk_bytes "$PLAN_DISK" 2>/dev/null || echo 0)"
+  case "$bytes" in ''|*[!0-9]*) die2 "cannot determine the size of $PLAN_DISK" ;; esac
+  gib="$(awk -v b="$bytes" 'BEGIN { printf "%d", b / 1073741824 }')"
+  if [ "$gib" -lt "$MIN_DISK_GIB" ]; then
+    die2 "$PLAN_DISK is ${gib} GiB — this install needs at least ${MIN_DISK_GIB} GiB"
+  fi
+}
+
+# Firmware is an *install-time* fact, not a planning one: a plan is a file you
+# may read on a different machine, so this is checked where it matters, and only
+# warned about in `plan`.
+require_uefi_or_die() {
+  if [ -d /sys/firmware/efi ]; then return 0; fi
+  die2 "this is a legacy-BIOS boot and the generated layout is UEFI only.\n  Run archinstall by hand for a BIOS install, or boot the medium in UEFI mode."
+}
+
+# ---- layout maths ---------------------------------------------------------
+# A partition cannot say "all the remaining space", so the root size is computed
+# from the device. 1 MiB before the ESP and 1 MiB after root keep the GPT tail
+# clear; the ESP is fixed because every systemd-boot install wants headroom.
+layout_root_start() { printf '%s' "$(( 1 + ESP_MIB ))"; }
+layout_root_size() {
+  local bytes="$1" total_mib
+  total_mib=$(( bytes / 1048576 ))
+  printf '%s' "$(( total_mib - 1 - ESP_MIB - 1 ))"
+}
+
+# ---------------------------------------------------------------------------
+# disks / status
+# ---------------------------------------------------------------------------
+# yes_no PREDICATE ARGS… — used inside command substitutions, where `cmd && a || b`
+# would depend on the predicate's exit status in a way set -e can trap.
+yes_no() {
+  if "$@"; then printf 'yes'; else printf 'no'; fi
+}
+
+cmd_disks() {
+  have "$LSBLK_BIN" || die2 "lsblk is missing (util-linux) — cannot list disks"
+  local dev candidates
+  printf '#DEVICE\tSIZE\tMODEL\tREMOVABLE\tIN_USE\n'
+  candidates="$("$LSBLK_BIN" -dpnro NAME -e 7,11 2>/dev/null || true)"
+  if [ -z "$candidates" ]; then
+    candidates="$("$LSBLK_BIN" -dpnro NAME 2>/dev/null || true)"
+  fi
+  while IFS= read -r dev; do
+    [ -n "$dev" ] || continue
+    case "$dev" in /dev/loop*|/dev/zram*|/dev/sr*|/dev/dm-*|/dev/md*) continue ;; esac
+    [ "$(disk_kind "$dev")" = "disk" ] || continue
+    printf '%s\t%s\t%s\t%s\t%s\n' \
+      "$dev" \
+      "$(disk_size_human "$dev")" \
+      "$(disk_model "$dev")" \
+      "$(yes_no disk_is_removable "$dev")" \
+      "$(yes_no disk_in_use "$dev")"
+  done <<<"$candidates"
+}
+
+cmd_status() {
+  local live="$(is_live_medium)" ver="" payload="missing" running
+  printf 'live\t%s\t%s\n' "$live" "$([ "$live" = yes ] && printf '/run/archiso present — this is the live medium' || printf 'running from an installed system')"
+  if have archinstall; then
+    ver="$(archinstall_version)"
+    printf 'archinstall\t%s\t%s\n' "${ver:-unknown}" "$(archinstall_version_note)"
+  else
+    printf 'archinstall\t\tnot installed — sudo pacman -S archinstall\n'
+  fi
+  [ -r "$PAYLOAD_DIR/install.sh" ] && payload="$PAYLOAD_DIR"
+  printf 'payload\t%s\t%s\n' "$payload" "$([ "$payload" = missing ] && printf 'the repository is not at %s' "$PAYLOAD_DIR" || printf 'install.sh found')"
+  printf 'firmware\t%s\t%s\n' "$([ -d /sys/firmware/efi ] && printf uefi || printf bios)" "$([ -d /sys/firmware/efi ] && printf 'UEFI installs supported' || printf 'legacy BIOS: the generated layout does not fit, use archinstall by hand')"
+  running="$(running_device)"
+  printf 'running_device\t%s\tnever offered as a target\n' "${running:-unknown}"
+  if [ -r "$LOG_FILE" ]; then
+    local lines last
+    lines="$(wc -l <"$LOG_FILE" 2>/dev/null | tr -d ' ' || echo 0)"
+    last="$(tail -n1 "$LOG_FILE" 2>/dev/null | cut -c1-90 || true)"
+    printf 'log\t%s\t%s lines, last: %s\n' "$LOG_FILE" "$lines" "$last"
+  else
+    printf 'log\t\tno install has been attempted yet\n'
+  fi
+  printf 'plan_dir\t%s\tgenerated configs land here\n' "$(plan_out_dir)"
+  return 0
+}
+
+archinstall_version() {
+  local v=""
+  if have archinstall; then
+    v="$(archinstall --version 2>/dev/null | sed -n '1p' || true)"
+  fi
+  if [ -z "$v" ] && have pacman; then
+    v="$(pacman -Q archinstall 2>/dev/null | awk '{print $2}' || true)"
+  fi
+  printf '%s' "$(printf '%s' "$v" | tr -d '\r')"
+}
+
+# The schema written above is the 3.x one. A different major version is the one
+# failure mode we cannot test for here, so it is called out before any disk I/O.
+archinstall_version_note() {
+  local v major
+  v="$(archinstall_version)"
+  major="$(printf '%s' "$v" | sed -E 's/^[^0-9]*([0-9]+).*/\1/')"
+  case "$major" in
+    ""|*[!0-9]*) printf 'version not recognised — inspect the config with: %s plan' "$PROG" ;;
+    "$KNOWN_ARCHINSTALL_MAJOR") printf 'config fields written for %s.x' "$KNOWN_ARCHINSTALL_MAJOR" ;;
+    *) printf 'WARNING: %s for %s.x — archinstall %s may reject these field names' "$PROG" "$KNOWN_ARCHINSTALL_MAJOR" "$major" ;;
+  esac
+}
+
+plan_out_dir() {
+  if [ -n "$PLAN_OUT" ]; then printf '%s' "$PLAN_OUT"; return 0; fi
+  if [ "$(id -u)" = "0" ]; then printf '/run/continuity-installer'; return 0; fi
+  printf '%s' "${XDG_STATE_HOME:-$HOME/.local/state}/continuity/installer"
+}
+
+# ---------------------------------------------------------------------------
+# plan
+# ---------------------------------------------------------------------------
+print_plan_summary() {
+  local bytes root_size sector
+  bytes="$(disk_bytes "$PLAN_DISK" 2>/dev/null || echo 0)"
+  root_size="$(layout_root_size "$bytes")"
+  sector="$(disk_logical_sector "$PLAN_DISK")"
+  say "plan for $PLAN_DISK"
+  printf '  disk          %s  (%s, %s, %s-byte sectors)\n' "$PLAN_DISK" "$(disk_size_human "$PLAN_DISK")" "$(disk_model "$PLAN_DISK")" "$sector"
+  printf '  layout        GPT: fat32 ESP %s MiB at /boot, %s %s MiB at /, rest of the disk\n' \
+    "$ESP_MIB" "$PLAN_FS" "$root_size"
+  printf '  everything on %s is erased — there is no dual-boot option here\n' "$PLAN_DISK"
+  printf '  hostname      %s\n' "$PLAN_HOST"
+  printf '  account       %s (wheel, video, render, audio, input), sudo enabled\n' "$PLAN_USER"
+  printf '  timezone      %s   locale %s   keymap %s\n' "$PLAN_TZ" "$PLAN_LOCALE" "$PLAN_KEYMAP"
+  printf '  bootloader    systemd-boot (UEFI)\n'
+  printf '  kernel        %s\n' "$TARGET_KERNEL"
+  printf '  archinstall   base packages only: %s\n' "${TARGET_PACKAGES[*]}"
+  printf '  then          %s/install.sh --all --yes --target-user %s runs inside the target,\n' "$PAYLOAD_DIR" "$PLAN_USER"
+  printf '                installing the desktop, the gaming stack and the 32-bit libraries\n'
+  printf '  finally       continuity-boot on --user %s (boot straight into the desktop)\n' "$PLAN_USER"
+  if [ -n "$PLAN_PASSWORD_FILE" ]; then
+    printf '  password      from %s\n' "$PLAN_PASSWORD_FILE"
+  else
+    printf '  password      prompted at install time; plan writes no credential file\n'
+  fi
+}
+
+cmd_plan() {
+  require_plan_args
+  validate_values_or_die
+  validate_disk_or_die
+
+  local bytes root_size sector out config creds
+  bytes="$(disk_bytes "$PLAN_DISK")"
+  root_size="$(layout_root_size "$bytes")"
+  sector="$(disk_logical_sector "$PLAN_DISK")"
+  if [ "$root_size" -lt 4096 ]; then
+    die2 "$PLAN_DISK leaves only ${root_size} MiB for the root filesystem"
+  fi
+  if [ ! -d /sys/firmware/efi ]; then
+    warn "this machine booted in legacy BIOS mode: the generated layout is UEFI only,"
+    warn "so `install` will refuse here. The plan itself is still what it claims to be."
+  fi
+  out="$(plan_out_dir)"
+  config="$out/install-config.json"
+  creds="$out/creds.json"
+
+  if [ "$PLAN_DRY" = "1" ]; then
+    write_config_json /dev/stdout "$sector" 1 "$(layout_root_start)" "$root_size"
+    printf '\n' >&2
+    if [ -n "$PLAN_PASSWORD_FILE" ]; then
+      printf 'a credentials file would be written to %s (not written in --dry-run)\n' "$creds" >&2
+    fi
+    print_plan_summary
+    return 0
+  fi
+
+  mkdir -p "$out" || die2 "cannot create $out"
+  write_config_json "$config" "$sector" 1 "$(layout_root_start)" "$root_size"
+  ok "wrote $config"
+
+  if [ -n "$PLAN_PASSWORD_FILE" ]; then
+    resolve_password
+    write_creds_json "$creds"
+    ok "wrote $creds (0600)"
+  fi
+
+  # Validate what we generated with the only JSON parser guaranteed to be here.
+  if have python3; then
+    if python3 -m json.tool "$config" >/dev/null 2>&1; then
+      ok "$config parses as JSON"
+    else
+      die2 "$config does not parse — this is a bug, please report it with the file"
+    fi
+    if [ -r "$creds" ] && ! python3 -m json.tool "$creds" >/dev/null 2>&1; then
+      die2 "$creds does not parse — this is a bug, please report it"
+    fi
+  else
+    warn "python3 is not installed, so the generated JSON was not parsed back"
+  fi
+
+  if [ "$PLAN_VALIDATE" = "1" ]; then
+    if have archinstall; then
+      say "asking archinstall to parse the config (limited preflight)"
+      if archinstall --config "$config" --dry-run >/dev/null 2>&1; then
+        ok "archinstall accepted the config"
+      else
+        warn "archinstall did not accept the config — read its output: archinstall --config $config --dry-run"
+      fi
+    else
+      warn "--validate: archinstall is not installed here, nothing to validate against"
+    fi
+  fi
+
+  print_plan_summary
+  printf '\n  next: %s install --disk %s --user %s --host %s --timezone %s --locale %s%s\n' \
+    "$PROG" "$PLAN_DISK" "$PLAN_USER" "$PLAN_HOST" "$PLAN_TZ" "$PLAN_LOCALE" \
+    "${PLAN_KEYMAP:+ --keymap $PLAN_KEYMAP}"
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+WAS_LIVE=0
+TARGET_MNT=""
+MOUNTED_ROOT=0
+MOUNTED_ESP=0
+BOUND=""
+WORK_DIR=""
+CONFIG_FILE=""
+CREDS_FILE=""
+
+cleanup() {
+  local rc=$?
+  set +e
+  # Unwind in reverse: chroot bind mounts, then ESP, then root — and only the
+  # mounts this script made, so a pre-existing /mnt is never disturbed.
+  local p
+  for p in $BOUND; do umount "$p" >/dev/null 2>&1; done
+  if [ "$MOUNTED_ESP" = "1" ] && [ -n "$TARGET_MNT" ]; then
+    umount "$TARGET_MNT/boot" >/dev/null 2>&1
+  fi
+  if [ "$MOUNTED_ROOT" = "1" ] && [ -n "$TARGET_MNT" ]; then
+    umount "$TARGET_MNT" >/dev/null 2>&1
+  fi
+  [ -n "$WORK_DIR" ] && rm -rf "$WORK_DIR" 2>/dev/null
+  return "$rc"
+}
+trap cleanup EXIT INT TERM
+
+# `--yes` on its own is not consent to erase a disk. Someone has to have said so
+# on the boot command line (continuityos.disk=…) or in the environment, which is
+# what the ISO's unattended entry sets.
+unattended_allowed() {
+  [ "$PLAN_YES" = "1" ] || return 1
+  [ "${CONTINUITY_ASSUME_YES:-0}" = "1" ] && return 0
+  case "$(cat /proc/cmdline 2>/dev/null || true)" in
+    *continuityos.disk=*) return 0 ;;
+  esac
+  return 1
+}
+
+confirm_erase() {
+  local expected answer
+  if unattended_allowed; then
+    ok "unattended install requested on the boot command line — not prompting"
+    return 0
+  fi
+  if [ "$PLAN_YES" = "1" ]; then
+    die2 "--yes alone is not enough to erase a disk. Either confirm interactively, or boot with continuityos.disk=$PLAN_DISK (the ISO's unattended entry sets it)."
+  fi
+  [ -t 0 ] || die2 "no terminal to confirm on — see --help for the unattended path"
+  expected="$(basename -- "$PLAN_DISK")"
+  printf '\n' >&2
+  warn "EVERYTHING on $PLAN_DISK is about to be erased: $(disk_size_human "$PLAN_DISK"), $(disk_model "$PLAN_DISK")"
+  printf 'Type %s to continue: ' "$expected" >&2
+  read -r answer || answer=""
+  [ "$answer" = "$expected" ] || die2 "not confirmed — nothing was written"
+}
+
+require_root() {
+  [ "$(id -u)" = "0" ] && { WAS_LIVE=0; return 0; }
+  if have sudo; then
+    say "installing needs root — re-running through sudo"
+    exec sudo -E env \
+      "CONTINUITY_INSTALLER_SYSBLOCK=$SYS_BLOCK" \
+      "CONTINUITY_INSTALLER_LSBLK=$LSBLK_BIN" \
+      "CONTINUITY_ASSUME_YES=${CONTINUITY_ASSUME_YES:-0}" \
+      "CONTINUITY_INSTALLER_LOG=$LOG_FILE" \
+      "$0" "${ORIG_ARGS[@]}"
+  fi
+  die2 "installing needs root and sudo is not available"
+}
+
+target_looks_like_root() {
+  local mnt="$1"
+  [ -r "$mnt/etc/os-release" ] || return 1
+  grep -qE '^ID=arch$' "$mnt/etc/os-release"
+}
+
+# archinstall may leave the target mounted at $MOUNT_ROOT (version-dependent), so
+# that is checked first; otherwise the disk's partitions are probed read-only for
+# an Arch root, which is the only reliable way to find it after the fact.
+find_target_root() {
+  local disk="$1" cur part mnt rc=0
+  if have findmnt; then
+    cur="$(findmnt -rno SOURCE --target "$MOUNT_ROOT" 2>/dev/null | sed -n '1p' || true)"
+    if [ -n "$cur" ] && target_looks_like_root "$MOUNT_ROOT"; then
+      printf '%s' "$cur"; return 0
+    fi
+  fi
+  while IFS= read -r part; do
+    [ -n "$part" ] || continue
+    mnt="$(mktemp -d)"
+    if mount -o ro "$part" "$mnt" 2>/dev/null; then
+      if target_looks_like_root "$mnt"; then
+        umount "$mnt" 2>/dev/null || true
+        rmdir "$mnt" 2>/dev/null || true
+        printf '%s' "$part"
+        return 0
+      fi
+      umount "$mnt" 2>/dev/null || true
+    fi
+    rmdir "$mnt" 2>/dev/null || true
+  done < <("$LSBLK_BIN" -pnrlo NAME,TYPE "$disk" 2>/dev/null | awk '$2 == "part" {print $1}')
+  return 1
+}
+
+# A user object that archinstall ignored (a schema change, or a version that
+# wants users elsewhere) must not leave a machine you cannot log into.
+ensure_target_user() {
+  local passwd_entry
+  passwd_entry="$(awk -F: -v u="$PLAN_USER" '$1 == u {print $1}' "$TARGET_MNT/etc/passwd" 2>/dev/null || true)"
+  if [ -n "$passwd_entry" ]; then
+    ok "account '$PLAN_USER' exists in the target"
+  else
+    warn "archinstall did not create '$PLAN_USER' — creating it inside the target"
+    chroot_run useradd -m -G wheel,video,render,audio,input -s /bin/bash "$PLAN_USER" \
+      || die2 "could not create '$PLAN_USER' in the target"
+    if [ "$PASSWORD_KEY" = "enc_password" ]; then
+      printf '%s:%s\n' "$PLAN_USER" "$PASSWORD_VALUE" | chroot_run chpasswd -e \
+        || die2 "could not set the password for '$PLAN_USER'"
+    else
+      printf '%s:%s\n' "$PLAN_USER" "$PASSWORD_VALUE" | chroot_run chpasswd \
+        || die2 "could not set the password for '$PLAN_USER'"
+    fi
+    ok "created '$PLAN_USER' with sudo (wheel) and the graphics/render groups"
+  fi
+  mkdir -p "$TARGET_MNT/home/$PLAN_USER" 2>/dev/null || true
+}
+
+# A chroot that can install packages needs the live system's network stack and
+# DNS. arch-chroot does this for us; without arch-install-scripts, do it here.
+chroot_run() {
+  if have arch-chroot; then
+    arch-chroot "$TARGET_MNT" "$@"
+    return $?
+  fi
+  local d
+  for d in dev proc sys run; do
+    [ -d "$TARGET_MNT/$d" ] || mkdir -p "$TARGET_MNT/$d"
+  done
+  mount --bind /dev "$TARGET_MNT/dev" 2>/dev/null && BOUND="$BOUND $TARGET_MNT/dev"
+  mount -t proc proc "$TARGET_MNT/proc" 2>/dev/null && BOUND="$BOUND $TARGET_MNT/proc"
+  mount -t sysfs sys "$TARGET_MNT/sys" 2>/dev/null && BOUND="$BOUND $TARGET_MNT/sys"
+  mount --bind /run "$TARGET_MNT/run" 2>/dev/null && BOUND="$BOUND $TARGET_MNT/run"
+  [ -r /etc/resolv.conf ] && cp /etc/resolv.conf "$TARGET_MNT/etc/resolv.conf" 2>/dev/null || true
+  chroot "$TARGET_MNT" "$@"
+}
+
+mount_target() {
+  local root_dev="$1" cur esp
+  if have findmnt; then
+    cur="$(findmnt -rno SOURCE --target "$MOUNT_ROOT" 2>/dev/null | sed -n '1p' || true)"
+  else
+    cur=""
+  fi
+  if [ -n "$cur" ]; then
+    if [ "$cur" != "$root_dev" ]; then
+      die2 "something else is already mounted at $MOUNT_ROOT ($cur) — refusing to touch it"
+    fi
+    mount -o remount,rw "$MOUNT_ROOT" 2>/dev/null || true
+  else
+    mkdir -p "$MOUNT_ROOT" 2>/dev/null || true
+    mount "$root_dev" "$MOUNT_ROOT" || die2 "could not mount $root_dev at $MOUNT_ROOT"
+    MOUNTED_ROOT=1
+  fi
+  TARGET_MNT="$MOUNT_ROOT"
+
+  esp="$("$LSBLK_BIN" -pnrlo NAME,FSTYPE "$PLAN_DISK" 2>/dev/null | awk '$2 == "vfat" {print $1}' | sed -n '1p' || true)"
+  if [ -n "$esp" ]; then
+    mkdir -p "$TARGET_MNT/boot" 2>/dev/null || true
+    if have findmnt && findmnt -rno SOURCE --target "$TARGET_MNT/boot" >/dev/null 2>&1; then
+      : # already mounted (archinstall left it that way)
+    else
+      mount "$esp" "$TARGET_MNT/boot" && MOUNTED_ESP=1 || warn "could not mount the EFI partition ($esp) — the bootloader is already written, but the payload copy continues"
+    fi
+  else
+    warn "no vfat partition found on $PLAN_DISK — check that the bootloader actually landed"
+  fi
+}
+
+target_command() {
+  # Run a command in the target, tee'd into the install log so a failure is
+  # diagnosable from the live session (or a photo of the screen).
+  local rc=0
+  set +e
+  chroot_run "$@" 2>&1 | tee -a "$LOG_FILE"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  return "$rc"
+}
+
+run_archinstall() {
+  local rc=0
+  say "running archinstall — this partitions $PLAN_DISK and takes several minutes"
+  set +e
+  archinstall --config "$CONFIG_FILE" --creds "$CREDS_FILE" --silent 2>&1 | tee -a "$LOG_FILE"
+  rc="${PIPESTATUS[0]}"
+  set -e
+  return "$rc"
+}
+
+deploy_payload() {
+  [ -r "$PAYLOAD_DIR/install.sh" ] || die2 "the ContinuityOS payload is not at $PAYLOAD_DIR — install.sh is missing"
+  say "copying the ContinuityOS payload into the new system"
+  mkdir -p "$TARGET_MNT/opt/continuityos"
+  rsync -a --exclude '.git/' "$PAYLOAD_DIR/" "$TARGET_MNT/opt/continuityos/" \
+    || die2 "could not copy $PAYLOAD_DIR into the target"
+  # The payload comes off a medium that may not preserve exec bits.
+  chmod 0755 "$TARGET_MNT/opt/continuityos/install.sh" 2>/dev/null || true
+  find "$TARGET_MNT/opt/continuityos/bin" -maxdepth 1 -type f -exec chmod 0755 {} + 2>/dev/null || true
+}
+
+# systemctl in a chroot has no systemd to talk to: `enable` is file work and
+# works on most versions, but this makes the boot experience independent of that.
+ensure_greetd_enabled() {
+  local unit="" candidate target="$TARGET_MNT"
+  for candidate in /usr/lib/systemd/system/greetd.service /lib/systemd/system/greetd.service; do
+    if [ -e "$target$candidate" ]; then unit="$candidate"; break; fi
+  done
+  if [ -z "$unit" ]; then
+    warn "greetd is not installed in the target — it will log in through a TTY instead"
+    return 1
+  fi
+  mkdir -p "$target/etc/systemd/system/multi-user.target.wants"
+  ln -sfn "$unit" "$target/etc/systemd/system/multi-user.target.wants/greetd.service"
+  return 0
+}
+
+verify_target() {
+  local root_dev="${1:-}" failures=0 boot_marker
+  say "verifying what actually landed on $PLAN_DISK"
+
+  if target_looks_like_root "$TARGET_MNT"; then
+    ok "a root filesystem with /etc/os-release ID=arch is on ${root_dev:-?} (mounted at $TARGET_MNT)"
+  else
+      die2 "no Arch root filesystem was found on $PLAN_DISK — archinstall exited successfully but nothing was installed (see $LOG_FILE)"
+  fi
+
+  if awk -F: -v u="$PLAN_USER" '$1 == u {found=1} END {exit found?0:1}' "$TARGET_MNT/etc/passwd"; then
+    ok "account '$PLAN_USER' is in the target's /etc/passwd"
+  else
+    warn "account '$PLAN_USER' is NOT in the target's /etc/passwd — you would have no way to log in"
+    failures=$((failures+1))
+  fi
+
+  boot_marker=""
+  for boot_marker in "$TARGET_MNT/boot/loader/loader.conf" "$TARGET_MNT/boot/EFI/systemd/systemd-bootx64.efi" \
+                   "$TARGET_MNT/boot/EFI/BOOT/BOOTX64.EFI" "$TARGET_MNT/boot/grub/grub.cfg"; do
+    [ -e "$boot_marker" ] && break
+    boot_marker=""
+  done
+  if [ -n "$boot_marker" ]; then
+    ok "bootloader installed: ${boot_marker#$TARGET_MNT}"
+  else
+    warn "no bootloader was found under /boot — the machine may not boot on its own"
+    failures=$((failures+1))
+  fi
+
+  if [ -x "$TARGET_MNT/usr/local/bin/continuity-shell" ]; then
+    ok "the ContinuityOS session is installed (/usr/local/bin/continuity-shell)"
+  else
+    warn "the ContinuityOS session is NOT installed — install.sh did not finish"
+    failures=$((failures+1))
+  fi
+
+  if [ -e "$TARGET_MNT/etc/greetd/config.toml" ]; then
+    if grep -q 'initial_session' "$TARGET_MNT/etc/greetd/config.toml" 2>/dev/null; then
+      ok "autologin is configured: boot goes straight into the desktop"
+    else
+      warn "greetd is configured without an initial_session — you will get a login prompt"
+    fi
+  else
+    warn "no greetd config in the target — the install will log in through a TTY"
+  fi
+
+  depth="$(du -sm "$TARGET_MNT/usr" 2>/dev/null | awk '{print $1}' || true)"
+  if [ -n "$depth" ] && [ "${depth:-0}" -gt 500 ]; then
+    ok "the target has a real package set (/usr is ${depth} MiB)"
+  else
+    warn "the target's /usr is only ${depth:-?} MiB — the package install inside the chroot probably failed"
+    failures=$((failures+1))
+  fi
+
+  return "$failures"
+}
+
+cmd_install() {
+  require_plan_args
+  validate_values_or_die
+  validate_disk_or_die
+  require_uefi_or_die
+  # Root before the prompt, not after: re-execing through sudo later would ask
+  # for the same confirmation twice.
+  require_root
+  confirm_erase
+
+  if ! have archinstall; then
+    die2 "archinstall is not installed — sudo pacman -S archinstall (it does the partitioning and the base system)"
+  fi
+  local ver note
+  ver="$(archinstall_version)"
+  note="$(archinstall_version_note)"
+  say "archinstall ${ver:-unknown}: $note"
+  case "$note" in WARNING:*) warn "$note" ;; esac
+
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  : >>"$LOG_FILE" 2>/dev/null || warn "cannot write the log at $LOG_FILE"
+  printf '\n==== %s install onto %s ====\n' "$(date -Is)" "$PLAN_DISK" >>"$LOG_FILE" 2>/dev/null || true
+
+  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/continuity-installer.XXXXXX")"
+  chmod 700 "$WORK_DIR" 2>/dev/null || true
+  local bytes root_size sector
+  bytes="$(disk_bytes "$PLAN_DISK")"
+  root_size="$(layout_root_size "$bytes")"
+  sector="$(disk_logical_sector "$PLAN_DISK")"
+  CONFIG_FILE="$WORK_DIR/install-config.json"
+  CREDS_FILE="$WORK_DIR/creds.json"
+  write_config_json "$CONFIG_FILE" "$sector" 1 "$(layout_root_start)" "$root_size"
+  resolve_password
+  write_creds_json "$CREDS_FILE"
+  ok "generated the archinstall config and a 0600 credential file in $WORK_DIR"
+
+  run_archinstall || die2 "archinstall failed (exit $?) — the log is $LOG_FILE. Nothing was deployed, and $PLAN_DISK is now in whatever state archinstall left it."
+
+  local root_dev=""
+  if ! root_dev="$(find_target_root "$PLAN_DISK")"; then
+    die2 "archinstall exited 0 but no Arch root filesystem was found on $PLAN_DISK — nothing was installed. A missing or rejected disk_config can do this; check $LOG_FILE and try: archinstall --config $CONFIG_FILE"
+  fi
+  ok "found the installed root filesystem: $root_dev"
+  mount_target "$root_dev"
+
+  ensure_target_user
+  deploy_payload
+
+  say "running install.sh inside the target (desktop, gaming stack, 32-bit libraries)"
+  if target_command /opt/continuityos/install.sh --all --yes --target-user "$PLAN_USER" --src /opt/continuityos; then
+    ok "install.sh finished in the target"
+  else
+    warn "install.sh did not finish cleanly — the machine may boot but be incomplete (log: $LOG_FILE)"
+  fi
+
+  if [ -x "$TARGET_MNT/usr/local/bin/continuity-boot" ]; then
+    if target_command /usr/local/bin/continuity-boot on --user "$PLAN_USER"; then
+      ok "autologin configured for '$PLAN_USER'"
+    else
+      warn "continuity-boot could not enable autologin — you will meet a login prompt"
+    fi
+    ensure_greetd_enabled || true
+  else
+    warn "/usr/local/bin/continuity-boot is not part of this build, so autologin was NOT configured:"
+    warn "  add bin/continuity-boot to install.sh's CLI list and re-run, or log in at the TTY and run: continuity-boot on --user $PLAN_USER"
+  fi
+
+  local failures=0 depth
+  verify_target "$root_dev" || failures=$?
+
+  printf '\n'
+  if [ "$failures" -eq 0 ]; then
+    ok "installation complete — remove the medium and reboot"
+    printf '\n  next: reboot. The machine boots into ContinuityOS; the first-run wizard is\n        already waiting on the desktop.\n'
+  else
+    warn "$failures verification step(s) did not pass — read $LOG_FILE before rebooting"
+    printf '  review: less %s\n' "$LOG_FILE"
+    exit 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# the graphical flow
+# ---------------------------------------------------------------------------
+# Every zenity call goes through zq: a Cancel is a clean no-op, not an error, and
+# a cancelled flow must leave the machine exactly as it was.
+zq() {
+  local out
+  if ! out="$("$@" 2>/dev/null)"; then
+    say "cancelled — nothing was changed"
+    exit 0
+  fi
+  printf '%s' "$out"
+}
+
+current_timezone() {
+  local tz=""
+  if have timedatectl; then
+    tz="$(timedatectl show -p Timezone --value 2>/dev/null | sed -n '1p' || true)"
+  fi
+  if [ -z "$tz" ] && [ -L /etc/localtime ]; then
+    tz="$(readlink /etc/localtime 2>/dev/null | sed -E 's|.*/zoneinfo/||' || true)"
+  fi
+  printf '%s' "${tz:-UTC}"
+}
+
+current_locale() {
+  local l=""
+  for l in "${LANG:-}" "$(locale 2>/dev/null | awk -F= '/^LANG=/ {print $2; exit}' || true)"; do
+    [ -n "$l" ] || continue
+    case "$l" in *.UTF-8|*.utf8) printf '%s' "$l"; return 0 ;; esac
+  done
+  printf 'en_US.UTF-8'
+}
+
+current_keymap() {
+  local k=""
+  if have localectl; then
+    k="$(localectl status 2>/dev/null | awk -F: '/VC Keymap/ {gsub(/^[ \t]+/, "", $2); print $2; exit}' || true)"
+  fi
+  [ -n "$k" ] || [ "$k" = "(unset)" ]
+  printf '%s' "${k:-us}"
+}
+
+# A searchable picker when the system can produce a list, a typed field when it
+# cannot — never a dead end.
+ui_pick_value() {
+  local title="$1" text="$2" default="$3" command="$4" items=() line
+  if [ -n "$command" ]; then
+    while IFS= read -r line; do
+      [ -n "$line" ] || continue
+      items+=("$line")
+    done < <($command 2>/dev/null || true)
+  fi
+  if [ "${#items[@]}" -gt 0 ]; then
+    zq zenity --list --title="$title" --width=620 --height=420 --text="$text" \
+      --column='Value' --search-column=1 --print-column=1 "${items[@]}"
+  else
+    zq zenity --entry --title="$title" --width=520 --text="$text" --entry-text="$default"
+  fi
+}
+
+ui_pick_disk() {
+  local args=() dev size model rem inuse
+  while IFS=$'\t' read -r dev size model rem inuse; do
+    case "$dev" in ''|'#'*) continue ;; esac
+    args+=(FALSE "$dev" "$size" "$model" "$rem" "$inuse")
+  done < <(cmd_disks)
+  if [ "${#args[@]}" -eq 0 ]; then
+    zenity --error --text='No disks were found to install onto.' 2>/dev/null || true
+    die2 "no disks found"
+  fi
+  zq zenity --list --radiolist --title='Which disk should ContinuityOS use?' \
+    --width=780 --height=360 \
+    --text='Everything on the chosen disk is erased. There is no dual-boot option here.' \
+    --column='' --column='Device' --column='Size' --column='Model' \
+    --column='Removable' --column='In use' --print-column=2 "${args[@]}"
+}
+
+ui_confirm_device() {
+  local dev="$1" expected typed
+  expected="$(basename -- "$dev")"
+  typed="$(zq zenity --entry --title='Last check' --width=560 \
+    --text="This erases everything on $dev ($(disk_size_human "$dev"), $(disk_model "$dev")).\n\nType $expected to continue:")"
+  if [ "$typed" != "$expected" ]; then
+    zenity --error --text="Not confirmed — nothing was written to $dev." 2>/dev/null || true
+    return 1
+  fi
+  return 0
+}
+
+ui_run_install() {
+  local dev="$1" host="$2" user="$3" tz="$4" locale="$5" keymap="$6" fs="$7" pwfile="$8"
+  local log="$LOG_FILE" routedir rcfile pid rc=0 args=()
+  routedir="$(dirname "$pwfile")"
+  rcfile="$routedir/rc"
+  : >"$log" 2>/dev/null || log="$routedir/install.log"
+  say "starting the install (log: $log)"
+
+  args=(install --disk "$dev" --user "$user" --host "$host" --timezone "$tz" \
+        --locale "$locale" --keymap "$keymap" --fs "$fs" --password-file "$pwfile" \
+        --log "$log" --yes)
+
+  # The typed confirmation above *is* the consent, but the CLI refuses --yes on
+  # its own (a stray --yes must not be enough to wipe a disk), so the variable
+  # that means "someone asked for this unattended" is set explicitly here.
+  if [ "$(id -u)" = "0" ]; then
+    ( CONTINUITY_ASSUME_YES=1 "$0" "${args[@]}" >/dev/null 2>>"$log"; printf '%s' "$?" >"$rcfile" ) &
+  else
+    ( sudo -n env "CONTINUITY_ASSUME_YES=1" "CONTINUITY_INSTALLER_LOG=$log" \
+        "$0" "${args[@]}" >/dev/null 2>>"$log"; printf '%s' "$?" >"$rcfile" ) &
+  fi
+  pid=$!
+  # --pulsate ignores the values we write; it just needs stdin to stay open until
+  # the install finishes, then closes and the window goes away.
+  { while kill -0 "$pid" 2>/dev/null; do printf '.'; sleep 2; done; } | \
+    zenity --progress --pulsate --auto-close --title='Installing ContinuityOS' --width=560 \
+      --text="Partitioning $dev, installing the system, then the desktop and the gaming stack.\n\nDetails: $log" >/dev/null 2>&1 || true
+  wait "$pid" 2>/dev/null || true
+  rc="$(cat "$rcfile" 2>/dev/null || echo 1)"
+  return "$rc"
+}
+
+cmd_ui() {
+  if ! have zenity; then
+    warn "zenity is not installed — falling back to terminal prompts"
+    cmd_ui_terminal
+    return 0
+  fi
+  if [ ! -d /sys/firmware/efi ]; then
+    zenity --error --text='This installer writes a UEFI layout. Boot the medium in UEFI mode, or use archinstall by hand.' 2>/dev/null || true
+    die2 "legacy BIOS boot — the generated layout is UEFI only"
+  fi
+  if [ "$(id -u)" != "0" ] && ! sudo -n true 2>/dev/null; then
+    zenity --error --text='Installing needs root, and this account cannot sudo without a password.' 2>/dev/null || true
+    die2 "no passwordless sudo: run the installer from a terminal with sudo, or use the live system's sudo rule"
+  fi
+
+  say "guided install — answering the questions below, then the disk is written"
+  zq zenity --info --title='Install ContinuityOS' --width=560 \
+    --text='This puts ContinuityOS on a disk of your choice.\n\nIt will:\n  • erase that entire disk (no dual boot, no encryption)\n  • install Arch, then the ContinuityOS desktop, gaming stack and 32-bit libraries\n  • set up autologin so the machine boots straight into the desktop\n\nNext: pick the disk.'
+
+  local dev host user tz locale keymap fs pw pw2 pwfile routedir
+  dev="$(ui_pick_disk)"
+  [ -n "$dev" ] || die2 "no disk selected"
+
+  host="$(zq zenity --entry --title='Hostname' --width=520 --text='Name this machine:' --entry-text='continuity')"
+  valid_hostname "$host" || die2 "'$host' is not a valid hostname"
+
+  user="$(zq zenity --entry --title='Your account' --width=520 --text='Username (lowercase letters, digits, dashes):' --entry-text='')"
+  valid_username "$user" || die2 "'$user' is not a usable account name"
+
+  while :; do
+    pw="$(zq zenity --password --title='Password' --width=520)"
+    pw2="$(zq zenity --password --title='Password (again)' --width=520)"
+    if [ -z "$pw" ]; then
+      zenity --error --text='An empty password would leave the account unable to use sudo.' 2>/dev/null || true
+      continue
+    fi
+    [ "$pw" = "$pw2" ] && break
+    zenity --error --text='The passwords do not match. Try again.' 2>/dev/null || true
+  done
+
+  tz="$(ui_pick_value 'Timezone' 'Pick your timezone:' "$(current_timezone)" 'timedatectl list-timezones')"
+  valid_timezone "$tz" || die2 "'$tz' does not look like an IANA timezone"
+  locale="$(ui_pick_value 'Language and format' 'Pick a locale (region + encoding):' "$(current_locale)" "localectl list-locales | grep -E 'UTF-8'")"
+  valid_locale "$locale" || die2 "'$locale' is not a valid locale"
+  keymap="$(ui_pick_value 'Keyboard layout' 'Pick the console and keyboard layout:' "$(current_keymap)" 'localectl list-keymaps')"
+  valid_keymap "$keymap" || die2 "'$keymap' is not a valid keymap"
+  fs="$(zq zenity --list --radiolist --title='Root filesystem' --width=520 --height=200 \
+    --text='ext4 is the safe default. btrfs adds snapshots (and one subvolume, @, mounted at /).' \
+    --column='' --column='Filesystem' --print-column=2 \
+    TRUE ext4 FALSE btrfs)"
+  [ "$fs" = "btrfs" ] || fs=ext4
+
+  routedir="$(mktemp -d "${TMPDIR:-/tmp}/continuity-installer-ui.XXXXXX")"
+  chmod 700 "$routedir" 2>/dev/null || true
+  pwfile="$routedir/password"
+  printf '%s\n' "$pw" >"$pwfile"
+  chmod 600 "$pwfile" 2>/dev/null || true
+  unset pw pw2
+
+  if ! ui_confirm_device "$dev"; then
+    rm -rf "$routedir"
+    exit 0
+  fi
+
+  local rc=0
+  ui_run_install "$dev" "$host" "$user" "$tz" "$locale" "$keymap" "$fs" "$pwfile" || rc=$?
+  rm -rf "$routedir"
+
+  if [ "$rc" != "0" ]; then
+    zenity --text-info --title='Install failed' --width=900 --height=560 \
+      --filename="$LOG_FILE" 2>/dev/null || true
+    die2 "the install failed (exit $rc) — the log is $LOG_FILE"
+  fi
+
+  if zenity --question --title='ContinuityOS is installed' --width=560 \
+      --text="ContinuityOS is on $dev.\n\nRemove the medium and reboot now?" \
+      --ok-label='Reboot now' --cancel-label='I will reboot later' 2>/dev/null; then
+    { systemctl reboot 2>/dev/null || sudo -n systemctl reboot 2>/dev/null; } || warn "reboot it yourself when ready"
+  else
+    ok "done — reboot whenever you are ready (the medium can be removed first)"
+  fi
+}
+
+# The same flow with nothing but a terminal — the live medium's console, an SSH
+# session, or a machine where zenity is missing.
+cmd_ui_terminal() {
+  say "guided install (terminal)"
+  cmd_disks >&2
+  printf '\n' >&2
+
+  local dev="" host="continuity" user="" tz="" locale="" keymap="" fs="ext4"
+  local pw="" pw2="" routedir="" pwfile="" answer=""
+
+  while [ -z "$dev" ]; do
+    printf 'Disk to erase (whole disk, e.g. /dev/nvme0n1): ' >&2
+    read -r dev || { say "cancelled — nothing was changed"; return 0; }
+    if [ -z "$dev" ]; then say "cancelled — nothing was changed"; return 0; fi
+  done
+  printf 'Hostname [%s]: ' "$host" >&2; read -r answer || answer=""
+  [ -n "$answer" ] && host="$answer"
+  while [ -z "$user" ]; do
+    printf 'Username: ' >&2
+    read -r user || { say "cancelled — nothing was changed"; return 0; }
+  done
+  while :; do
+    printf 'Password for %s: ' "$user" >&2; read -rs pw || pw=""; printf '\n' >&2
+    printf 'Repeat it: ' >&2; read -rs pw2 || pw2=""; printf '\n' >&2
+    [ "$pw" = "$pw2" ] && [ -n "$pw" ] && break
+    warn "the passwords do not match (or are empty) — try again"
+  done
+  printf 'Timezone [%s]: ' "$(current_timezone)" >&2; read -r answer || answer=""
+  tz="${answer:-$(current_timezone)}"
+  printf 'Locale [%s]: ' "$(current_locale)" >&2; read -r answer || answer=""
+  locale="${answer:-$(current_locale)}"
+  printf 'Keyboard layout [%s]: ' "$(current_keymap)" >&2; read -r answer || answer=""
+  keymap="${answer:-$(current_keymap)}"
+  printf 'Root filesystem (ext4/btrfs) [%s]: ' "$fs" >&2; read -r answer || answer=""
+  [ "$answer" = "btrfs" ] && fs=btrfs
+
+  routedir="$(mktemp -d "${TMPDIR:-/tmp}/continuity-installer-ui.XXXXXX")"
+  chmod 700 "$routedir" 2>/dev/null || true
+  pwfile="$routedir/password"
+  printf '%s\n' "$pw" >"$pwfile"
+  chmod 600 "$pwfile" 2>/dev/null || true
+  unset pw pw2
+
+  # plan does the refusing: a bad disk, a mounted disk, a bad hostname or a
+  # nonexistent timezone all stop here — before anything is written.
+  if ! "$0" plan --disk "$dev" --user "$user" --host "$host" --timezone "$tz" \
+       --locale "$locale" --keymap "$keymap" --fs "$fs" --password-file "$pwfile"; then
+    rm -rf "$routedir"
+    return 1
+  fi
+
+  printf '\nType %s to erase %s: ' "$(basename -- "$dev")" "$dev" >&2
+  read -r answer || answer=""
+  if [ "$answer" != "$(basename -- "$dev")" ]; then
+    rm -rf "$routedir"
+    say "not confirmed — nothing was changed"
+    return 0
+  fi
+
+  local rc=0
+  CONTINUITY_ASSUME_YES=1 "$0" install --disk "$dev" --user "$user" --host "$host" \
+    --timezone "$tz" --locale "$locale" --keymap "$keymap" --fs "$fs" \
+    --password-file "$pwfile" --yes || rc=$?
+  rm -rf "$routedir"
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+# The exact invocation is kept so require_root can re-exec through sudo with the
+# same arguments — including the test seams, which sudo -E would otherwise drop.
+ORIG_ARGS=("$@")
+
+# --option=value is accepted as well as --option value.
+_normalized=()
+for _a in "$@"; do
+  case "$_a" in
+    --*=*) _normalized+=("${_a%%=*}" "${_a#*=}") ;;
+    *)     _normalized+=("$_a") ;;
+  esac
+done
+if [ "${#_normalized[@]}" -gt 0 ]; then set -- "${_normalized[@]}"; fi
+
+ACTION="${1:-}"
+if [ "$#" -gt 0 ]; then shift; fi
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --disk)
+      [ "$#" -ge 2 ] || usage_error "--disk needs a device path"
+      DISK_ARGS=$((DISK_ARGS+1))
+      [ "$DISK_ARGS" -le 1 ] || usage_error "only one --disk may be given"
+      PLAN_DISK="$2"; shift 2 ;;
+    --user)          [ "$#" -ge 2 ] || usage_error "--user needs a name"; PLAN_USER="$2"; shift 2 ;;
+    --host)          [ "$#" -ge 2 ] || usage_error "--host needs a name"; PLAN_HOST="$2"; shift 2 ;;
+    --timezone)      [ "$#" -ge 2 ] || usage_error "--timezone needs a value"; PLAN_TZ="$2"; shift 2 ;;
+    --locale)        [ "$#" -ge 2 ] || usage_error "--locale needs a value"; PLAN_LOCALE="$2"; shift 2 ;;
+    --keymap)        [ "$#" -ge 2 ] || usage_error "--keymap needs a value"; PLAN_KEYMAP="$2"; shift 2 ;;
+    --fs)            [ "$#" -ge 2 ] || usage_error "--fs needs a value"; PLAN_FS="$2"; shift 2 ;;
+    --password-file) [ "$#" -ge 2 ] || usage_error "--password-file needs a path"; PLAN_PASSWORD_FILE="$2"; shift 2 ;;
+    --out)           [ "$#" -ge 2 ] || usage_error "--out needs a directory"; PLAN_OUT="$2"; shift 2 ;;
+    --log)           [ "$#" -ge 2 ] || usage_error "--log needs a path"; PLAN_LOG="$2"; LOG_FILE="$2"; shift 2 ;;
+    --dry-run)       PLAN_DRY=1; shift ;;
+    --validate)      PLAN_VALIDATE=1; shift ;;
+    --allow-removable) PLAN_ALLOW_REMOVABLE=1; shift ;;
+    -y|--yes)        PLAN_YES=1; shift ;;
+    -h|--help|help)  usage; exit 0 ;;
+    *)               usage_error "unknown argument '$1'" ;;
+  esac
+done
+
+case "$ACTION" in
+  disks|list)   cmd_disks ;;
+  plan)         cmd_plan ;;
+  install)      cmd_install ;;
+  ui|guided)    cmd_ui ;;
+  status|info)  cmd_status ;;
+  -h|--help|help) usage; exit 0 ;;
+  "")
+    usage >&2
+    exit 2
+    ;;
+  *)
+    printf '%s: unknown command %s\n' "$PROG" "$ACTION" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

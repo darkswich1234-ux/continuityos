@@ -1,0 +1,70 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ContinuityOS — continuity-dark-03 "Facet"
+  3840x2160 geometric variant: overlapping translucent polygons + a fine grid.
+  The grid is 1px at 1x so it reads as texture, not lines, behind a window.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="3840" height="2160" viewBox="0 0 3840 2160"
+     preserveAspectRatio="xMidYMid slice" role="img" aria-label="Dark geometric facet gradient">
+  <defs>
+    <linearGradient id="bg3" x1="0.15" y1="0" x2="0.85" y2="1">
+      <stop offset="0"   stop-color="#06070c"/>
+      <stop offset="0.5" stop-color="#0a0b16"/>
+      <stop offset="1"   stop-color="#04050a"/>
+    </linearGradient>
+
+    <linearGradient id="facetA" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b9cff" stop-opacity="0.20"/>
+      <stop offset="1" stop-color="#0b3b7a" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="facetB" x1="1" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#9d6bff" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#3a1e78" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="facetC" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#17d2b4" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#0a5a52" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="facetD" x1="0.5" y1="0" x2="0.5" y2="1">
+      <stop offset="0" stop-color="#ff6f61" stop-opacity="0.10"/>
+      <stop offset="1" stop-color="#ff6f61" stop-opacity="0"/>
+    </linearGradient>
+
+    <pattern id="grid3" width="120" height="120" patternUnits="userSpaceOnUse">
+      <path d="M120 0 H0 V120" fill="none" stroke="#9ec8ff" stroke-opacity="0.045" stroke-width="1"/>
+    </pattern>
+
+    <radialGradient id="vig3" cx="50%" cy="50%" r="75%">
+      <stop offset="0.55" stop-color="#000000" stop-opacity="0"/>
+      <stop offset="1"    stop-color="#000000" stop-opacity="0.68"/>
+    </radialGradient>
+
+    <filter id="blur160" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="160"/>
+    </filter>
+  </defs>
+
+  <rect width="3840" height="2160" fill="url(#bg3)"/>
+  <rect width="3840" height="2160" fill="url(#grid3)"/>
+
+  <!-- large soft facets -->
+  <g filter="url(#blur160)">
+    <polygon points="-300,400 1500,-250 1900,900 300,1500"   fill="url(#facetA)"/>
+    <polygon points="1700,-350 4200,150 3900,1250 2200,700"  fill="url(#facetB)"/>
+    <polygon points="500,2400 2300,1500 3500,2100 1800,2600" fill="url(#facetC)"/>
+    <polygon points="-400,1900 900,1300 1600,2300 -200,2600" fill="url(#facetD)"/>
+  </g>
+
+  <!-- crisp accent edges: the "fold" lines between facets -->
+  <g fill="none" stroke-linecap="round">
+    <path d="M1500 -250 L 1900 900 L 300 1500"       stroke="#4db8ff" stroke-opacity="0.16" stroke-width="3"/>
+    <path d="M2200 700 L 3900 1250 L 4200 150"       stroke="#b08cff" stroke-opacity="0.14" stroke-width="3"/>
+    <path d="M2300 1500 L 3500 2100"                 stroke="#2ee6c0" stroke-opacity="0.13" stroke-width="3"/>
+    <path d="M-200 2600 L 1600 2300 L 900 1300"      stroke="#ff8a7a" stroke-opacity="0.10" stroke-width="3"/>
+  </g>
+
+  <!-- centre calm zone: keeps icons readable where windows land -->
+  <ellipse cx="1920" cy="1080" rx="1500" ry="820" fill="#03040a" opacity="0.42" filter="url(#blur160)"/>
+
+  <rect width="3840" height="2160" fill="url(#vig3)"/>
+</svg>

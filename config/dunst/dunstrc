@@ -1,0 +1,123 @@
+# =============================================================================
+#  ContinuityOS — dunst notifications, styled as Android heads-up cards
+# =============================================================================
+#  Installed to ~/.config/dunst/dunstrc by install.sh --user and started by
+#  continuity-session-start. Everything a notification can use lives in [global];
+#  the per-urgency sections below only override what dunst allows them to
+#  (background, foreground, frame_color, timeout).
+#
+#  Palette matches config/waybar/style.css and config/eww/eww.scss:
+#    surface #101014  container #1b1b20  on-surface #e6e1e5  accent #a8c7fa
+#    error #ffb4ab
+# =============================================================================
+
+[global]
+    ### Display
+    monitor = 0
+    # Follow the pointer's output — right for a laptop-plus-monitor setup.
+    follow = mouse
+    width = 380
+    height = 300
+    origin = top-center
+    # A phone-sized gap from the top edge; 8 with the Waybar pill above it.
+    offset = 8x56
+    notification_limit = 5
+    # Notification bodies fade out rather than snapping away.
+    gap_size = 8
+
+    ### Geometry / shape
+    # 16px corners and no square frame is what makes it read as a card.
+    corner_radius = 16
+    frame_width = 1
+    frame_color = "#43474e"
+    separator_height = 0
+    padding = 14
+    horizontal_padding = 16
+    text_icon_padding = 12
+    indent = 0
+
+    ### Typography
+    font = Noto Sans 11
+    line_height = 4
+    markup = full
+    format = "<b>%s</b>\n%b"
+    alignment = left
+    vertical_alignment = center
+    word_wrap = yes
+    ellipsize = middle
+    ignore_newline = no
+
+    ### Icons
+    icon_position = left
+    min_icon_size = 24
+    max_icon_size = 48
+    icon_theme = Papirus-Dark
+    enable_recursive_icon_lookup = true
+
+    ### Progress bars (downloads, volume, battery)
+    progress_bar = true
+    progress_bar_height = 6
+    progress_bar_frame_width = 0
+    progress_bar_min_width = 120
+    progress_bar_max_width = 380
+    progress_bar_corner_radius = 3
+
+    ### Colours — translucent so the compositor blur shows through
+    background = "#101014EE"
+    foreground = "#e6e1e5"
+    highlight = "#a8c7fa"
+
+    ### Behaviour
+    timeout = 8
+    # Keep the tray-visible history reasonable without unbounded growth.
+    history_length = 40
+    ignore_dbusclose = false
+    # Do not pop "your battery is charging" style duplicates.
+    duplicate_wait = 4
+    startup_notification = false
+    # Suspend notifications while a fullscreen window (a game) is focused.
+    fullscreen = show
+    idle_threshold = 120
+
+    ### Input
+    mouse_left_click = close_current
+    mouse_middle_click = do_action, close_current
+    mouse_right_click = close_all
+    # Keyboard: Ctrl+Shift+Space is the drawer's "clear all" equivalent.
+    close_all = ctrl+shift+space
+    close_current = ctrl+space
+
+    ### Layer / compositor integration
+    # "overlay" keeps notifications above fullscreen-video windows; Hyprland's
+    # layerrule blur is applied to the `dunst` namespace in config/hypr/conf.d/rules.conf.
+    layer = overlay
+
+    ### Misc
+    sort = urgency_ascending
+    verbosity = mesg
+    # Let Dunst keep its own state file under the ContinuityOS state dir.
+    # (Leave unset unless you want to relocate it: state_dir is read from
+    #  XDG_STATE_HOME on startup.)
+    dmenu = /usr/bin/rofi -dmenu -p dunst:
+    pushover = no
+
+[urgency_low]
+    background = "#1b1b20EE"
+    foreground = "#e6e1e5"
+    frame_color = "#43474e"
+    highlight = "#9a9aa0"
+    timeout = 5
+
+[urgency_normal]
+    background = "#101014EE"
+    foreground = "#e6e1e5"
+    frame_color = "#a8c7fa"
+    highlight = "#a8c7fa"
+    timeout = 8
+
+[urgency_critical]
+    background = "#2a1416EE"
+    foreground = "#ffd9d4"
+    frame_color = "#ffb4ab"
+    highlight = "#ffb4ab"
+    timeout = 0

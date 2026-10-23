@@ -1,0 +1,446 @@
+#!/usr/bin/env bash
+# ContinuityOS prefix manager — inspect, clean and uninstall isolated Wine prefixes.
+#
+#   continuity-prefix list                    one slug per line (machine readable)
+#   continuity-prefix info MyGame             human summary + disk usage
+#   continuity-prefix path MyGame             print the prefix directory
+#   continuity-prefix scan MyGame             list .exe inside drive_c
+#   continuity-prefix launchers MyGame --auto register launchers for found .exe
+#   continuity-prefix rm MyGame               complete, verifiable uninstall
+#   continuity-prefix export MyGame out.tar.zst
+#   continuity-prefix import out.tar.zst
+#   continuity-prefix winetricks MyGame ...   run winetricks in the prefix
+#   continuity-prefix protontricks MyGame ... run protontricks in the prefix
+#   continuity-prefix regedit MyGame          open the prefix registry
+#   continuity-prefix kill MyGame             stop all processes of the prefix
+#   continuity-prefix browse MyGame           open drive_c in the file manager
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-prefix: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+# Absolute path to this script, so the interactive manager can re-exec itself.
+SELF="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+# Generated launchers call continuity-run directly (no shell), so prefer the
+# absolute installed path and only fall back to a PATH lookup for in-tree runs.
+CONTINUITY_RUN_BIN="${CONTINUITY_RUN_BIN:-}"
+if [ -z "$CONTINUITY_RUN_BIN" ]; then
+  if [ -x /usr/local/bin/continuity-run ]; then
+    CONTINUITY_RUN_BIN=/usr/local/bin/continuity-run
+  else
+    CONTINUITY_RUN_BIN=continuity-run
+  fi
+fi
+
+# Set by the scan/info subcommands to include prefix plumbing (system .exe files);
+# bound here so `set -u` cannot trip the launcher scan.
+ALL_EXES=0
+
+usage() {
+  cat <<'EOF'
+continuity-prefix — manage ContinuityOS universal Windows prefixes
+
+USAGE
+  continuity-prefix <command> [args]
+
+COMMANDS
+  list [--json] [--paths]        List prefixes (default: slugs, one per line)
+  info <slug>                    Prefix details, size, executables, launchers
+  path <slug>                    Print the prefix directory
+  scan <slug> [--all]            List launchable .exe in drive_c
+  launchers <slug> [--auto] [--list] [--remove]
+                                 Create/list/remove desktop launchers for a prefix
+  rm <slug> [--yes]              Delete prefix and its launchers (full uninstall)
+  export <slug> <file.tar.zst>   Archive a prefix (zstd when available)
+  import <file[.tar.zst|.tar.gz]> <slug>
+  winetricks <slug> [args...]    Run winetricks against the prefix
+  protontricks <slug> [args...]  Run protontricks (its 32-bit path) against the prefix
+  regedit <slug>                 Open regedit for the prefix
+  kill <slug>                    Kill all processes running in the prefix
+  browse <slug>                  Open drive_c in the file manager
+  manage                         Interactive picker (used by the desktop entry)
+  root                           Print the prefix root
+
+EXAMPLES
+  continuity-prefix list
+  continuity-prefix launchers mygame --auto
+  continuity-prefix rm mygame          # removes ~/.local/share/universal-prefixes/mygame
+  # Proton's Wine prefix is stored at <compatdata>/pfx; legacy prefixes are migrated.
+EOF
+}
+
+[ $# -ge 1 ] || { usage >&2; exit 2; }
+CMD="$1"; shift
+
+# --- helpers ------------------------------------------------------------------
+prefix_exists() { [ -d "$(continuity_prefix_dir "$1")" ]; }
+require_slug() {
+  local slug
+  slug="$(continuity_slugify "${1:?missing slug}")"
+  prefix_exists "$slug" || continuity_die "no such prefix: $slug (try 'continuity-prefix list')"
+  printf '%s' "$slug"
+}
+
+human_size() {
+  local dir="$1"
+  if continuity_have du; then du -sh "$dir" 2>/dev/null | cut -f1; else printf '?'; fi
+}
+
+is_system_exe() {
+  # Executables that are part of the prefix plumbing, not user applications.
+  local rel="$1"
+  case "$rel" in
+    windows/*|*/windows/*) return 0 ;;
+    *"/Windows/"*|*"/windows/"*) return 0 ;;
+    *Microsoft.NET*|*Installer*|*WinMetadata*) return 0 ;;
+    */unins*.exe|*/Unins*.exe|*/uninstall*.exe) return 0 ;;
+    */rundll32.exe|*/msiexec.exe|*/regsvr32.exe|*/cmd.exe|*/explorer.exe) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+prefix_drive_c() { continuity_prefix_drive_c "$1"; }
+
+list_exes() {
+  local slug="$1" root
+  root="$(prefix_drive_c "$slug")"
+  [ -d "$root" ] || return 0
+  find "$root" -type f -iname '*.exe' 2>/dev/null | while IFS= read -r f; do
+    local rel="${f#"$root"/}"
+    if is_system_exe "$rel"; then
+      [ "$ALL_EXES" = "1" ] && printf '%s\n' "$rel" || true
+    else
+      printf '%s\n' "$rel"
+    fi
+  done | sort
+}
+
+exe_icon() {
+  # Best-effort .exe icon extraction into the launcher dir (icoutils).
+  local exe="$1" icon_name="$2" outdir="$3"
+  continuity_have wrestool || return 1
+  continuity_have icotool || return 1
+  local tmp
+  tmp="$(mktemp -d)" || return 1
+  if wrestool -x -t 14 "$exe" -o "$tmp" >/dev/null 2>&1; then
+    local ico
+    ico="$(find "$tmp" -name '*.ico' -print -quit 2>/dev/null)"
+    if [ -n "$ico" ]; then
+      mkdir -p "$outdir"
+      if icotool -x -o "$outdir" "$ico" >/dev/null 2>&1; then
+        local png
+        png="$(find "$outdir" -name "${icon_name}*.png" -print -quit 2>/dev/null)"
+        [ -n "$png" ] || png="$(find "$outdir" -name '*.png' -print -quit 2>/dev/null)"
+        if [ -n "$png" ]; then
+          # Prefer the largest extracted frame.
+          local big
+          big="$(find "$outdir" -name '*.png' -printf '%s %p\n' 2>/dev/null | sort -n | tail -n1 | cut -d' ' -f2-)"
+          [ -n "$big" ] && { printf '%s\n' "$big"; rm -rf "$tmp"; return 0; }
+        fi
+      fi
+    fi
+  fi
+  rm -rf "$tmp"
+  return 1
+}
+
+write_launcher() {
+  local slug="$1" rel_exe="$2" name="$3" icon="$4"
+  local prefix drive exe exe_abs launcher_dir launcher_file
+  prefix="$(continuity_prefix_dir "$slug")"
+  drive="$(prefix_drive_c "$slug")"
+  exe_abs="$drive/$rel_exe"
+  [ -f "$exe_abs" ] || return 1
+  launcher_dir="$CONTINUITY_LAUNCHER_DIR/$slug"
+  mkdir -p "$launcher_dir"
+  launcher_file="$launcher_dir/$(continuity_slugify "$name").desktop"
+
+  # Exec= never sees a shell: absolute path, quoted, %f-free (we already have the path).
+  {
+    printf '[Desktop Entry]\n'
+    printf 'Type=Application\n'
+    printf 'Version=1.0\n'
+    printf 'Name=%s\n' "$name"
+    printf 'Comment=Windows application (ContinuityOS Universal Compatibility Engine)\n'
+    printf 'Exec=%s --name %s --quiet %s\n' \
+      "$CONTINUITY_RUN_BIN" "$(continuity_exec_escape "$slug")" "$(continuity_exec_escape "$exe_abs")"
+    printf 'TryExec=%s\n' "$CONTINUITY_RUN_BIN"
+    printf 'Icon=%s\n' "$icon"
+    printf 'Terminal=false\n'
+    printf 'Categories=Game;Wine;\n'
+    printf 'Keywords=Windows;Proton;Wine;ContinuityOS;\n'
+    printf 'X-ContinuityOS-Prefix=%s\n' "$slug"
+    printf 'X-ContinuityOS-Executable=%s\n' "$rel_exe"
+  } >"$launcher_file"
+  chmod 644 "$launcher_file"
+  printf '%s\n' "$launcher_file"
+}
+
+# --- commands -----------------------------------------------------------------
+case "$CMD" in
+  root) continuity_load_env; printf '%s\n' "$CONTINUITY_PREFIX_ROOT" ;;
+
+  list)
+    JSON=0; SHOW_PATHS=0
+    for a in "$@"; do
+      case "$a" in
+        --json) JSON=1 ;;
+        --paths) SHOW_PATHS=1 ;;
+        *) continuity_die "unknown option for list: $a" ;;
+      esac
+    done
+    continuity_load_env
+    [ -d "$CONTINUITY_PREFIX_ROOT" ] || exit 0
+    if [ "$JSON" = "1" ]; then
+      first=1
+      printf '['
+      while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        slug="$(basename "$d")"
+        [ "$first" = "1" ] || printf ','
+        first=0
+        printf '{"slug":"%s","path":"%s","size":"%s"}' "$slug" "$d" "$(human_size "$d")"
+      done < <(find "$CONTINUITY_PREFIX_ROOT" -maxdepth 1 -mindepth 1 -type d | sort)
+      printf ']\n'
+    elif [ "$SHOW_PATHS" = "1" ]; then
+      find "$CONTINUITY_PREFIX_ROOT" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort
+    else
+      find "$CONTINUITY_PREFIX_ROOT" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+    fi
+    ;;
+
+  path)
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix path <slug>}")"
+    printf '%s\n' "$(continuity_prefix_dir "$slug")"
+    ;;
+
+  info)
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix info <slug>}")"
+    dir="$(continuity_prefix_dir "$slug")"
+    ALL_EXES=0
+    printf 'Prefix:      %s\n' "$slug"
+    printf 'Path:        %s\n' "$dir"
+    printf 'drive_c:     %s\n' "$(prefix_drive_c "$slug")"
+    printf 'Size:        %s\n' "$(human_size "$dir")"
+    printf 'Created:     %s\n' "$(stat -c %y "$dir" 2>/dev/null | cut -d. -f1)"
+    drive="$(prefix_drive_c "$slug")"
+    printf 'Arch:        %s\n' "$([ -d "$drive/Program Files (x86)" ] && echo 'win64 (WoW64)' || echo win32)"
+    printf 'Executables:\n'
+    list_exes "$slug" | sed 's/^/  - /' || true
+    launcher_dir="$CONTINUITY_LAUNCHER_DIR/$slug"
+    if [ -d "$launcher_dir" ]; then
+      printf 'Launchers:\n'
+      find "$launcher_dir" -name '*.desktop' -printf '  - %f\n' 2>/dev/null | sort
+    fi
+    ;;
+
+  scan)
+    continuity_load_env
+    ALL_EXES=0
+    [ "${2:-}" = "--all" ] && ALL_EXES=1
+    slug="$(require_slug "${1:?usage: continuity-prefix scan <slug>}")"
+    list_exes "$slug"
+    ;;
+
+  launchers)
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix launchers <slug> [--auto|--list|--remove]}")"
+    shift
+    mode="auto"
+    for a in "$@"; do
+      case "$a" in
+        --auto) mode="auto" ;;
+        --list) mode="list" ;;
+        --remove) mode="remove" ;;
+        *) continuity_die "unknown option: $a" ;;
+      esac
+    done
+    prefix="$(continuity_prefix_dir "$slug")"
+    launcher_dir="$CONTINUITY_LAUNCHER_DIR/$slug"
+    case "$mode" in
+      list)
+        [ -d "$launcher_dir" ] || exit 0
+        find "$launcher_dir" -name '*.desktop' -printf '%f\n' | sort
+        ;;
+      remove)
+        [ -d "$launcher_dir" ] && rm -rf "$launcher_dir"
+        continuity_refresh_desktop_db
+        continuity_ok "removed launchers for '$slug'"
+        ;;
+      auto)
+        count=0
+        icon_root="$CONTINUITY_STATE_DIR/icons/$slug"
+        while IFS= read -r rel; do
+          [ -n "$rel" ] || continue
+          base="${rel##*/}"; stem="${base%.*}"
+          icon="$CONTINUITY_ASSET_DIR/icons/windows-app.svg"
+          if extracted="$(exe_icon "$(prefix_drive_c "$slug")/$rel" "$(continuity_slugify "$stem")" "$icon_root" 2>/dev/null)"; then
+            icon="$extracted"
+          fi
+          if out="$(write_launcher "$slug" "$rel" "$stem" "$icon")"; then
+            count=$((count+1))
+            [ "${CONTINUITY_QUIET:-0}" = "1" ] || printf 'launcher: %s -> %s\n' "$stem" "$out"
+          fi
+        done < <(list_exes "$slug")
+        continuity_refresh_desktop_db
+        if [ "$count" -gt 0 ]; then
+          continuity_ok "registered $count launcher(s) for '$slug'"
+        else
+          continuity_info "no user executables found in '$slug' (installers often place them under 'Program Files')"
+        fi
+        ;;
+    esac
+    ;;
+
+  rm)
+    continuity_load_env
+    YES=0
+    args=()
+    for a in "$@"; do case "$a" in --yes|-y) YES=1 ;; *) args+=("$a") ;; esac; done
+    slug="$(require_slug "${args[0]:?usage: continuity-prefix rm <slug>}")"
+    dir="$(continuity_prefix_dir "$slug")"
+    if [ "$YES" != "1" ]; then
+      continuity_confirm "Permanently delete prefix '$slug' and everything in $dir?" || continuity_die "aborted"
+    fi
+    # Kill anything still running out of this prefix before deleting it.
+    if continuity_have pgrep; then
+      pkill -f -- "$dir" >/dev/null 2>&1 || true
+    fi
+    rm -rf -- "$dir"
+    rm -rf -- "$CONTINUITY_LAUNCHER_DIR/$slug"
+    rm -rf -- "$CONTINUITY_STATE_DIR/icons/$slug"
+    continuity_refresh_desktop_db
+    continuity_ok "uninstalled '$slug' (prefix + launchers removed)"
+    ;;
+
+  export)
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix export <slug> <file.tar.zst>}")"
+    out="${2:?usage: continuity-prefix export <slug> <file.tar.zst>}"
+    dir="$(continuity_prefix_dir "$slug")"
+    parent="$(dirname "$dir")"
+    if continuity_have zstd; then
+      tar -C "$parent" -cf - "$slug" | zstd -T0 -o "$out"
+    else
+      continuity_warn "zstd not installed; falling back to gzip"
+      tar -C "$parent" -czf "$out" "$slug"
+    fi
+    continuity_ok "exported '$slug' -> $out"
+    ;;
+
+  import)
+    continuity_load_env
+    src="${1:?usage: continuity-prefix import <file> [slug]}"
+    [ -f "$src" ] || continuity_die "no such archive: $src"
+    slug="$(continuity_slugify "${2:-$(basename "${src%%.tar*}")}")"
+    continuity_ensure_dirs
+    mkdir -p "$CONTINUITY_PREFIX_ROOT"
+    case "$src" in
+      *.zst) continuity_require zstd "$(continuity_pkg_command zstd 2>/dev/null || printf 'install zstd')" ;;
+    esac
+    if [ -e "$CONTINUITY_PREFIX_ROOT/$slug" ]; then
+      continuity_confirm "Prefix '$slug' exists. Merge archive into it?" || continuity_die "aborted"
+    fi
+    if continuity_have zstd && [ "${src##*.}" = "zst" ]; then
+      zstd -dc -- "$src" | tar -C "$CONTINUITY_PREFIX_ROOT" -xf -
+    else
+      tar -C "$CONTINUITY_PREFIX_ROOT" -xf "$src"
+    fi
+    continuity_ok "imported into $CONTINUITY_PREFIX_ROOT/$slug"
+    ;;
+
+  manage)
+    # Friendly entry point for the "Windows Applications" desktop entry:
+    # pick a prefix, then pick an action, with the look of the app drawer.
+    continuity_load_env
+    mapfile -t prefixes < <(find "$CONTINUITY_PREFIX_ROOT" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort)
+    if [ "${#prefixes[@]}" -eq 0 ]; then
+      msg='No Windows applications yet. Double-click any .exe (or run: continuity-run <file.exe>) to create one.'
+      continuity_have notify-send && notify-send -i windows-app 'ContinuityOS' "$msg" 2>/dev/null || true
+      printf '%s\n' "$msg"
+      exit 0
+    fi
+    if ! continuity_have rofi; then
+      printf '%s\n' "${prefixes[@]}"
+      exit 0
+    fi
+    theme_args=()
+    [ -r "${XDG_CONFIG_HOME:-$HOME/.config}/rofi/continuity.rasi" ] && \
+      theme_args=(-theme "${XDG_CONFIG_HOME:-$HOME/.config}/rofi/continuity.rasi")
+    pick="$(printf '%s\n' "${prefixes[@]}" | rofi -dmenu -i -p 'Windows app' ${theme_args[@]:+"${theme_args[@]}"})" || exit 0
+    [ -n "$pick" ] || exit 0
+    action="$(printf 'Open folder\nRegister launchers\nShow executables\nShow details\nRun protontricks\nRun winetricks\nRemove completely\n' \
+      | rofi -dmenu -i -p "$pick" ${theme_args[@]:+"${theme_args[@]}"}) " || exit 0
+    case "$action" in
+      'Open folder')        exec "$SELF" browse "$pick" ;;
+      'Register launchers') exec "$SELF" launchers "$pick" --auto ;;
+      'Show executables')
+        if continuity_have foot; then exec foot -e "$SELF" scan "$pick" --all
+        else exec "$SELF" scan "$pick" --all; fi ;;
+      'Show details')
+        if continuity_have foot; then exec foot -e "$SELF" info "$pick"
+        else exec "$SELF" info "$pick"; fi ;;
+      'Run protontricks')
+        # protontricks is the Proton-aware front end for the 32-bit prefix; it is
+        # the one the drawer offers first, because these prefixes are Proton's.
+        if continuity_have foot; then exec foot -e "$SELF" protontricks "$pick"
+        else exec "$SELF" protontricks "$pick"; fi ;;
+      'Run winetricks')
+        if continuity_have foot; then exec foot -e "$SELF" winetricks "$pick"
+        else exec "$SELF" winetricks "$pick"; fi ;;
+      'Remove completely')
+        if continuity_confirm "Delete the entire prefix '$pick' and its launchers?"; then
+          exec "$SELF" rm "$pick" --yes
+        fi ;;
+      *) exit 0 ;;
+    esac
+    ;;
+
+  winetricks|protontricks|regedit|kill|browse)
+    continuity_load_env
+    slug="$(require_slug "${1:?usage: continuity-prefix $CMD <slug>}")"
+    shift
+    dir="$(continuity_prefix_dir "$slug")"
+    case "$CMD" in
+      winetricks)
+        continuity_require winetricks "$(continuity_pkg_command winetricks 2>/dev/null || printf 'install winetricks')"
+        WINEPREFIX="$(continuity_prefix_wine_dir "$slug")" exec winetricks "$@"
+        ;;
+      protontricks)
+        continuity_require protontricks "$(continuity_pkg_command protontricks 2>/dev/null || printf 'install protontricks')"
+        exec protontricks --no-bwrap -c "$(continuity_prefix_wine_dir "$slug")" "$@"
+        ;;
+      regedit)
+        if continuity_have wine; then WINEPREFIX="$(continuity_prefix_wine_dir "$slug")" exec wine regedit "$@"
+        else continuity_die "wine is required for regedit ($(continuity_pkg_command wine wine32 2>/dev/null || printf 'install wine'))"; fi
+        ;;
+      kill)
+        continuity_have pgrep || continuity_die "pgrep not available"
+        pkill -f -- "$dir" && continuity_ok "stopped processes for '$slug'" || continuity_info "nothing running for '$slug'"
+        ;;
+      browse)
+        if continuity_have xdg-open; then xdg-open "$(prefix_drive_c "$slug")" >/dev/null 2>&1 &
+        else printf '%s\n' "$(prefix_drive_c "$slug")"; fi
+        ;;
+    esac
+    ;;
+
+  -h|--help|help) usage ;;
+  *) usage >&2; exit 2 ;;
+esac

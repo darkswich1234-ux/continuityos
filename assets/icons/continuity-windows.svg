@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  ContinuityOS asset — CC0-1.0
+  continuity-windows.svg — the Universal Windows Compatibility Engine mark. Used by
+  the continuity-wine.desktop handler and in compatibility notifications.
+
+  Design: an open application window with an S-curve passing through it — the visual
+  shorthand for "this Windows window is being translated onto a Linux session".
+  Light strokes on a translucent dark plate for contrast on any wallpaper.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256"
+     role="img" aria-labelledby="title cwDesc">
+  <title id="title">Windows compatibility engine</title>
+  <desc id="cwDesc">An open window with a flowing curve passing through it.</desc>
+
+  <defs>
+    <linearGradient id="cwPlate" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1b20" stop-opacity="0.92"/>
+      <stop offset="1" stop-color="#101014" stop-opacity="0.92"/>
+    </linearGradient>
+    <linearGradient id="cwFlow" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0"   stop-color="#c6dbff"/>
+      <stop offset="0.55" stop-color="#a8c7fa"/>
+      <stop offset="1"   stop-color="#7ba7f0"/>
+    </linearGradient>
+    <filter id="cwShadow" x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+  </defs>
+
+  <rect x="18" y="18" width="220" height="220" rx="52" fill="#000000" opacity="0.35" filter="url(#cwShadow)"/>
+  <rect x="16" y="16" width="220" height="220" rx="52" fill="url(#cwPlate)"
+        stroke="#43474e" stroke-width="2"/>
+
+  <!-- window: title bar + body, drawn as light strokes with a soft surface -->
+  <g fill="none" stroke="#e6e1e5" stroke-width="8" stroke-linecap="round" stroke-linejoin="round">
+    <rect x="56" y="70" width="144" height="116" rx="18" fill="#e6e1e5" fill-opacity="0.06"/>
+    <line x1="56" y1="100" x2="200" y2="100"/>
+  </g>
+  <circle cx="76" cy="85" r="4" fill="#e6e1e5"/>
+  <circle cx="92" cy="85" r="4" fill="#e6e1e5" opacity="0.6"/>
+  <circle cx="108" cy="85" r="4" fill="#e6e1e5" opacity="0.35"/>
+
+  <!-- the warp: translation happening inside the frame -->
+  <path d="M36 168 C 84 132, 118 196, 166 156 S 214 128, 226 148"
+        fill="none" stroke="url(#cwFlow)" stroke-width="12" stroke-linecap="round"/>
+  <path d="M36 176 C 84 140, 118 204, 166 164 S 214 136, 226 156"
+        fill="none" stroke="#a8c7fa" stroke-opacity="0.25" stroke-width="20" stroke-linecap="round"/>
+</svg>

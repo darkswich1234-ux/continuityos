@@ -1,0 +1,1134 @@
+#!/usr/bin/env bash
+# ContinuityOS — first-run wizard: the out-of-box flow.
+#
+#   greeting -> Steam library -> first Windows app -> Balanced/Gaming -> done
+#
+# This script is the whole brain. The Eww shell (window names wizard,
+# wizard-steam, wizard-windows, wizard-mode, wizard-done) is only a view: every
+# button calls a subcommand here, and every polled label comes from `get`.
+# Run headless — no eww, no compositor — it still works from a TTY, because a
+# first-run flow that cannot be completed is worse than none.
+#
+#   continuity-wizard show-once          called at login: opens it only once
+#   continuity-wizard start [--force]    open the wizard (remembered page)
+#   continuity-wizard get KEY            raw value for an Eww poll
+#   continuity-wizard state              all values as KEY=VALUE
+#   continuity-wizard goto PAGE          show one page (welcome|steam|windows|mode|done)
+#   continuity-wizard next|back          page navigation
+#   continuity-wizard scan-steam         find Steam libraries (--json for machines)
+#   continuity-wizard import-steam DIR   register an existing library with Steam
+#   continuity-wizard pick-exe           choose a Windows file (zenity/kdialog/…)
+#   continuity-wizard install-exe FILE   install it into its own prefix
+#   continuity-wizard set-mode MODE      balanced|gaming  (and remember it)
+#   continuity-wizard finish             mark the flow complete and close
+#   continuity-wizard close              close without marking it complete
+#   continuity-wizard reset              forget everything and start over
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-wizard: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+continuity_load_env
+continuity_ensure_dirs
+
+# Order is the flow: the keyboard and the network come first because everything
+# after them is less pleasant to do with the wrong layout and no connection,
+# and the engine check comes after the apps so it is checking something real.
+PAGES=(welcome region steam transfer windows shakedown mode done)
+
+# The installed handler is preferred; a PATH lookup keeps in-tree runs working.
+RUN_BIN="${CONTINUITY_RUN_BIN:-}"
+if [ -z "$RUN_BIN" ]; then
+  if [ -x /usr/local/bin/continuity-run ]; then RUN_BIN=/usr/local/bin/continuity-run; else RUN_BIN=continuity-run; fi
+fi
+STATE_FILE="$CONTINUITY_STATE_DIR/wizard.state"
+DONE_FILE="$CONTINUITY_STATE_DIR/wizard.done"
+INSTALL_LOG="$CONTINUITY_STATE_DIR/wizard-install.log"
+APP_PID_FILE="$CONTINUITY_STATE_DIR/wizard-install.pid"
+CONFIG_FILE="$CONTINUITY_CONFIG_DIR/environment.conf"
+
+usage() {
+  cat <<'EOF'
+continuity-wizard — ContinuityOS first-run setup
+
+USAGE
+  continuity-wizard <command> [args]
+
+COMMANDS
+  show-once                 Open the wizard at login, but only if never completed
+  start [--force]           Open the wizard (resumes the remembered page)
+  goto <page>               Show one page
+                            welcome|region|steam|transfer|windows|shakedown|mode|done
+  autodetect                Apply the locale/keyboard/zone this machine reports
+  pick-locale               Choose the language and region (zenity/rofi list)
+  pick-keymap               Choose the keyboard layout
+  pick-timezone             Choose the time zone
+  wifi-join                 Pick a Wi-Fi network and connect to it
+  shakedown [--probe]       Check that games can actually run (--probe launches one)
+  transfer-export           Save this whole setup to one archive in $HOME
+  transfer-import [ARCHIVE] Bring a setup over from another machine
+  open-prefix               Open the current app's prefix folder
+  next | back               Move between pages
+  get <key>                 Print one state value (used by the Eww polls)
+  state [--json]            Print every state value
+  scan-steam [--json]       Find Steam libraries, including on other mounts
+  import-steam <dir>        Register an existing library folder with Steam
+  pick-exe                  Ask the user for a Windows executable
+  install-exe <file>        Install it into its own isolated prefix
+  set-mode <balanced|gaming>
+                            Apply the session style and remember it for next login
+  finish                    Mark the flow complete and close
+  close                     Close without marking it complete
+  reset [--purge-log]       Forget the flow so it runs again from zero
+  -h, --help                This help
+
+STATE
+  ~/.local/state/continuity/wizard.state       current page and results
+  ~/.local/state/continuity/wizard.done        written by `finish`
+  ~/.local/state/continuity/wizard-install.log installer output
+
+The heavy lifting lives in three separate tools, each usable on its own:
+  continuity-region      locale, keyboard, time zone, Wi-Fi
+  continuity-shakedown   will games run on this machine?
+  continuity-export      export/import a whole setup
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# state
+# ---------------------------------------------------------------------------
+default_state() {
+  cat <<'EOF'
+PAGE=welcome
+STEAM_LIBRARY=
+STEAM_SUMMARY=
+STEAM_GAMES=0
+STEAM_CANDIDATES=0
+APP_NAME=
+APP_STATE=none
+APP_PATH=
+REGION_LOCALE=
+REGION_KEYMAP=
+REGION_TIMEZONE=
+REGION_WIFI=
+REGION_SUMMARY=
+SHAKEDOWN_STATE=unknown
+SHAKEDOWN_SUMMARY=
+SHAKEDOWN_HEADLINE=
+SHAKEDOWN_FIX=
+SHAKEDOWN_FAIL=0
+SHAKEDOWN_WARN=0
+TRANSFER_STATE=idle
+TRANSFER_ARCHIVE=
+TRANSFER_SUMMARY=
+MODE=balanced
+ERROR=
+EOF
+}
+
+wizard_init_state() {
+  [ -e "$STATE_FILE" ] || { default_state >"$STATE_FILE"; chmod 600 "$STATE_FILE"; }
+}
+
+wizard_get() {
+  wizard_init_state
+  awk -F= -v k="$1" '$1==k {sub(/^[^=]*=/,""); print; exit}' "$STATE_FILE"
+}
+
+wizard_set() {
+  wizard_init_state
+  local key="$1" value="${2-}" tmp
+  # Values are single-line by construction; strip newlines so the file stays parseable.
+  value="${value//$'\n'/ }"
+  tmp="$STATE_FILE.tmp"
+  # Match on "KEY=" at the start of the line rather than splitting on '=', because
+  # values (paths, error text) legitimately contain '=' themselves.
+  awk -v k="$key" -v v="$value" '
+    BEGIN { found = 0 }
+    index($0, k "=") == 1 { print k "=" v; found = 1; next }
+    { print }
+    END { if (!found) print k "=" v }
+  ' "$STATE_FILE" >"$tmp"
+  mv "$tmp" "$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# the Eww view
+# ---------------------------------------------------------------------------
+HAVE_EWW=0
+continuity_have eww && HAVE_EWW=1
+
+wizard_windows() {
+  printf '%s\n' wizard wizard-region wizard-steam wizard-transfer \
+    wizard-windows wizard-shakedown wizard-mode wizard-done
+}
+
+# One window per step, and these names are the contract with config/eww/eww.yuck.
+window_for_page() {
+  case "$1" in
+    welcome)   printf 'wizard' ;;
+    region)    printf 'wizard-region' ;;
+    steam)     printf 'wizard-steam' ;;
+    transfer)  printf 'wizard-transfer' ;;
+    windows)   printf 'wizard-windows' ;;
+    shakedown) printf 'wizard-shakedown' ;;
+    mode)      printf 'wizard-mode' ;;
+    done)      printf 'wizard-done' ;;
+    *)         printf 'wizard' ;;
+  esac
+}
+
+eww_ready() {
+  [ "$HAVE_EWW" = "1" ] || return 1
+  continuity_have pgrep && pgrep -x eww >/dev/null 2>&1 || {
+    setsid eww daemon >/dev/null 2>&1 &
+    local i
+    for i in $(seq 1 20); do pgrep -x eww >/dev/null 2>&1 && break; sleep 0.1; done
+  }
+  pgrep -x eww >/dev/null 2>&1
+}
+
+close_windows() {
+  [ "$HAVE_EWW" = "1" ] || return 0
+  continuity_have pgrep && pgrep -x eww >/dev/null 2>&1 || return 0
+  local w
+  for w in $(wizard_windows); do eww close "$w" >/dev/null 2>&1 || true; done
+}
+
+show_page() {
+  local page="${1:-welcome}" win
+  case " ${PAGES[*]} " in *" $page "*) ;; *) continuity_die "unknown page '$page' (want: ${PAGES[*]})" ;; esac
+  wizard_set PAGE "$page"
+  # A step whose content is a live reading of this machine refreshes on entry,
+  # not on every poll: the Eww labels read stored state, so a poll never shells
+  # out to a hardware check every two seconds.
+  case "$page" in
+    region)    refresh_region ;;
+    shakedown) refresh_shakedown ;;
+    transfer)  [ -n "$(wizard_get TRANSFER_SUMMARY)" ] || wizard_set TRANSFER_SUMMARY "No archive yet" ;;
+  esac
+  if [ "$HAVE_EWW" = "1" ]; then
+    if eww_ready; then
+      close_windows
+      win="$(window_for_page "$page")"
+      eww open "$win" >/dev/null 2>&1 || continuity_warn "could not open the '$win' window (check ~/.config/eww with: eww reload)"
+    else
+      continuity_warn "eww is not running — showing page '$page' as text instead"
+      printf 'ContinuityOS setup — page: %s\n' "$page"
+      printf 'Install eww (sudo pacman -S eww) to use the graphical wizard.\n'
+    fi
+  else
+    printf 'ContinuityOS setup — page: %s\n' "$page"
+    printf 'Install eww (sudo pacman -S eww) for the graphical wizard; every step below still works:\n'
+    printf '  continuity-wizard scan-steam\n  continuity-wizard pick-exe\n  continuity-wizard set-mode gaming\n  continuity-wizard finish\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Steam
+# ---------------------------------------------------------------------------
+steam_roots() {
+  local r
+  for r in "$HOME/.steam/steam" "$HOME/.local/share/Steam" "$HOME/.steam/root" \
+           "/usr/share/steam" "$HOME/.var/app/com.valvesoftware.Steam/data/Steam"; do
+    [ -d "$r/steamapps" ] && printf '%s\n' "$r"
+  done
+  # A `[ -d ] && printf` chain returns 1 when the last candidate is absent, which
+  # under `set -e` + pipefail would abort callers. Never fail: "no roots" is a
+  # legitimate answer.
+  return 0
+}
+
+# First line of a producer, without `| head -n1` (which SIGPIPEs the producer and
+# makes the pipeline fail under pipefail).
+first_line() { printf '%s\n' "$1" | sed -n '1p'; }
+
+# Libraries Steam already knows about, from libraryfolders.vdf.
+registered_libraries() {
+  local root lf
+  while IFS= read -r root; do
+    lf="$root/steamapps/libraryfolders.vdf"
+    [ -r "$lf" ] || continue
+    # Every "path" value in the VDF is a library root.
+    sed -n 's/^[[:space:]]*"path"[[:space:]]*"\(.*\)"[[:space:]]*$/\1/p' "$lf"
+  done < <(steam_roots) | sort -u || true
+}
+
+# Candidate library folders that are *not* registered yet: a steamapps directory
+# on any real mount, which is what "my games are on the other drive" looks like.
+candidate_libraries() {
+  local registered targets target
+  registered="$(registered_libraries | tr '\n' '|')"
+  if continuity_have findmnt; then
+    targets="$(findmnt -rno TARGET,FSTYPE 2>/dev/null \
+      | awk '$2 !~ /^(tmpfs|devtmpfs|proc|sysfs|devpts|cgroup|cgroup2|overlay|squashfs|autofs|mqueue|debugfs|tracefs|securityfs|fusectl|ramfs|binfmt_misc|rpc_pipefs|configfs|pstore|efivarfs|nsfs)$/ {print $1}' \
+      | sort -u)"
+  else
+    targets="$(printf '%s\n' "$HOME" /mnt /media /run/media /srv /opt)"
+  fi
+  while IFS= read -r target; do
+    [ -n "$target" ] || continue
+    [ -d "$target" ] || continue
+    # Bounded search: a steamapps dir at the mount root or up to three levels
+    # beneath it (…/Games/SteamLibrary/steamapps is the common Windows layout).
+    # A permission-denied mount must not abort the scan (set -e / pipefail).
+    find "$target" -maxdepth 3 -type d -name steamapps 2>/dev/null || true
+  done <<< "$targets" | while IFS= read -r sa; do
+    lib="${sa%/steamapps}"
+    [ -n "$lib" ] || continue
+    case "$registered" in *"$lib|"*) continue ;; esac
+    # Only count a library that actually holds installed games.
+    local count
+    count="$(find "$sa" -maxdepth 1 -name 'appmanifest_*.acf' 2>/dev/null | wc -l || true)"
+    [ "$count" -gt 0 ] && printf '%s\n' "$lib"
+  done | sort -u || true
+}
+
+library_game_count() {
+  local lib="$1" count
+  # `|| true` because a library on a disconnected drive makes find fail, and a
+  # failed count must read as 0 rather than aborting the wizard.
+  count="$(find "$lib/steamapps" -maxdepth 1 -name 'appmanifest_*.acf' 2>/dev/null | wc -l || true)"
+  printf '%s' "$(printf '%s' "$count" | tr -d ' ')"
+}
+
+library_game_names() {
+  local lib="$1" n="${2:-3}" i=0 acf acfs
+  acfs="$(find "$lib/steamapps" -maxdepth 1 -name 'appmanifest_*.acf' 2>/dev/null | sort || true)"
+  while IFS= read -r acf; do
+    [ -n "$acf" ] || continue
+    i=$((i+1))
+    [ "$i" -gt "$n" ] && break
+    # Single awk per file: no upstream pipe, so nothing can be SIGPIPEd.
+    awk -F'"' '/^[[:space:]]*"name"/ { print $4; exit }' "$acf" 2>/dev/null || true
+  done <<< "$acfs"
+  return 0
+}
+
+refresh_steam_summary() {
+  local cands count summary
+  cands="$(candidate_libraries | wc -l | tr -d ' ' || true)"
+  cands="$(printf '%s' "$cands" | tr -d '[:space:]')"
+  case "$cands" in ''|*[!0-9]*) cands=0 ;; esac
+  wizard_set STEAM_CANDIDATES "$cands"
+  if [ "$cands" -gt 0 ]; then
+    summary="$cands unregistered Steam library folder(s) found"
+  else
+    if [ -n "$(first_line "$(steam_roots)")" ]; then
+      summary="Steam is installed — every library is already registered"
+    else
+      summary="Steam was not found on this machine"
+    fi
+  fi
+  wizard_set STEAM_SUMMARY "$summary"
+}
+
+cmd_scan_steam() {
+  local json=0
+  [ "${1:-}" = "--json" ] && json=1
+  refresh_steam_summary
+  local first=1 lib count names
+  if [ "$json" = "1" ]; then
+    printf '['
+    while IFS= read -r lib; do
+      [ -n "$lib" ] || continue
+      count="$(library_game_count "$lib")"
+      [ "$first" = "1" ] || printf ','
+      first=0
+      printf '{"path":"%s","games":%s}' "$lib" "$count"
+    done < <(candidate_libraries)
+    printf ']\n'
+  else
+    if [ "$(wizard_get STEAM_CANDIDATES)" = "0" ]; then
+      printf '%s\n' "$(wizard_get STEAM_SUMMARY)"
+      printf 'Registered libraries:\n'
+      registered_libraries | sed 's/^/  - /' || true
+      return 0
+    fi
+    printf 'Unregistered Steam libraries (%s):\n' "$(wizard_get STEAM_CANDIDATES)"
+    while IFS= read -r lib; do
+      [ -n "$lib" ] || continue
+      count="$(library_game_count "$lib")"
+      names="$(library_game_names "$lib" 3 | paste -sd', ' -)"
+      printf '  - %s  (%s game(s)%s)\n' "$lib" "$count" "${names:+: $names}"
+    done < <(candidate_libraries)
+  fi
+}
+
+wizard_greeting() {
+  local hour user host part
+  hour="$(date +%H)"
+  user="$(id -un)"
+  host="$(uname -n 2>/dev/null || echo this machine)"
+  case "$hour" in
+    0[0-4]|0[5-9]) part="Good morning" ;;
+    1[0-1])      part="Good morning" ;;
+    1[2-7])      part="Good afternoon" ;;
+    *)           part="Good evening" ;;
+  esac
+  printf '%s, %s. Let’s get %s set up.' "$part" "$user" "$host"
+}
+
+cmd_import_steam() {
+  local dir="${1:-}"
+  if [ "$dir" = "--first" ]; then
+    # Convenience for the wizard's one-tap button: take the first library found.
+    dir="$(first_line "$(candidate_libraries)")"
+    if [ -z "$dir" ]; then
+      wizard_set ERROR "No unregistered Steam library was found on this machine."
+      continuity_die "nothing to import — no unregistered Steam library found"
+    fi
+    continuity_info "importing the first library found: $dir"
+  fi
+  [ -n "$dir" ] || continuity_die "usage: continuity-wizard import-steam <library-dir>|--first"
+  dir="$(readlink -f -- "$dir" 2>/dev/null || printf '%s' "$dir")"
+  [ -d "$dir/steamapps" ] || continuity_die "'$dir' does not look like a Steam library (no steamapps/ in it)"
+
+  # Steam rewrites libraryfolders.vdf when it exits, so editing it while Steam
+  # runs is the one way to reliably lose the change.
+  if continuity_have pgrep && pgrep -x steam >/dev/null 2>&1; then
+    wizard_set ERROR "Close Steam first — it rewrites its library list on exit."
+    continuity_die "Steam is running. Quit Steam, then import the library again."
+  fi
+
+  local root lf
+  root="$(first_line "$(steam_roots)")"
+  if [ -z "$root" ]; then
+    wizard_set ERROR "Steam is not installed yet — start Steam once, then import."
+    continuity_die "no Steam installation found (looked in ~/.steam/steam and ~/.local/share/Steam)"
+  fi
+  lf="$root/steamapps/libraryfolders.vdf"
+
+  # NOT `grep -q`: it exits early, SIGPIPEs the producer, and under pipefail the
+  # pipeline reads as failure — which would make a duplicate import insert a
+  # second entry instead of doing nothing.
+  if registered_libraries | grep -Fx "$dir" >/dev/null 2>&1; then
+    wizard_set STEAM_LIBRARY "$dir"
+    wizard_set STEAM_GAMES "$(library_game_count "$dir")"
+    wizard_set ERROR ""
+    continuity_ok "'$dir' is already registered with Steam"
+    return 0
+  fi
+
+  mkdir -p "$root/steamapps"
+  if [ ! -f "$lf" ]; then
+    printf '"libraryfolders"\n{\n\t"0"\n\t{\n\t\t"path"\t\t"%s"\n\t}\n}\n' "$root" >"$lf"
+  fi
+  cp -a "$lf" "$lf.continuity-backup"
+
+  # The next free numeric key: Steam numbers library entries from 0 upwards.
+  local next_idx
+  next_idx="$(sed -n 's/^[[:space:]]*"\([0-9]\+\)"[[:space:]]*$/\1/p' "$lf" | sort -n | tail -n1)"
+  next_idx=$(( ${next_idx:--1} + 1 ))
+
+  local open close tmp
+  local before_entries
+  before_entries="$(sed -n 's/^[[:space:]]*"\([0-9]\+\)"[[:space:]]*$/\1/p' "$lf" | wc -l | tr -d ' ')"
+  tmp="$(mktemp)" || continuity_die "cannot create a temporary file"
+  awk -v idx="$next_idx" -v path="$dir" '
+    { line[NR] = $0 }
+    END {
+      last = 0
+      for (i = NR; i >= 1; i--) if (line[i] ~ /^[[:space:]]*}[[:space:]]*$/) { last = i; break }
+      for (i = 1; i <= NR; i++) {
+        if (i == last) {
+          printf "\t\"%s\"\n\t{\n\t\t\"path\"\t\t\"%s\"\n\t\t\"label\"\t\t\"\"\n\t\t\"totalsize\"\t\"0\"\n\t}\n", idx, path
+        }
+        print line[i]
+      }
+    }' "$lf" >"$tmp"
+  open="$(tr -cd '{' <"$tmp" | wc -c | tr -d ' ')"
+  close="$(tr -cd '}' <"$tmp" | wc -c | tr -d ' ')"
+  after_entries="$(sed -n 's/^[[:space:]]*"\([0-9]\+\)"[[:space:]]*$/\1/p' "$tmp" | wc -l | tr -d ' ')"
+
+  # A VDF edit is only acceptable if braces still balance and exactly one library
+  # entry was added. (Comparing the raw brace *character* count would reject every
+  # valid insert, since a new block adds both an opening and a closing brace.)
+  if [ ! -s "$tmp" ] || [ "$open" != "$close" ] || \
+     [ "$after_entries" != "$(( before_entries + 1 ))" ]; then
+    rm -f "$tmp"
+    wizard_set ERROR "Refused to write a malformed library list; nothing was changed."
+    continuity_die "the edit would have corrupted $lf ($open '{' vs $close '}', entries $before_entries -> $after_entries) — nothing was changed (backup: $lf.continuity-backup)"
+  fi
+  if ! grep -Fq "$dir" "$tmp"; then
+    rm -f "$tmp"
+    wizard_set ERROR "The library was not inserted; nothing was changed."
+    continuity_die "insertion failed — $lf is unchanged (backup: $lf.continuity-backup)"
+  fi
+
+  mv "$tmp" "$lf"
+  wizard_set STEAM_LIBRARY "$dir"
+  wizard_set STEAM_GAMES "$(library_game_count "$dir")"
+  wizard_set ERROR ""
+  continuity_log "wizard: imported Steam library $dir (index $next_idx)"
+  continuity_ok "registered '$dir' with Steam ($(library_game_count "$dir") game(s))"
+  printf 'Restart Steam to see the games. Backup: %s\n' "$lf.continuity-backup"
+}
+
+# ---------------------------------------------------------------------------
+# First Windows app
+# ---------------------------------------------------------------------------
+cmd_pick_exe() {
+  local picked=""
+  if continuity_have zenity; then
+    picked="$(zenity --file-selection \
+      --title='Choose a Windows program to install' \
+      --file-filter='Windows programs | *.exe *.msi *.bat *.cmd *.lnk' \
+      --file-filter='All files | *' 2>/dev/null || true)"
+  elif continuity_have kdialog; then
+    picked="$(kdialog --getopenfilename "$HOME" '*.exe *.msi' 2>/dev/null || true)"
+  elif continuity_have yad; then
+    picked="$(yad --file --title='Choose a Windows program' 2>/dev/null || true)"
+  elif continuity_have qarma; then
+    picked="$(qarma --file-selection 2>/dev/null || true)"
+  fi
+
+  if [ -z "$picked" ]; then
+    # No graphical chooser: fall back to the obvious places so the wizard is
+    # still completable from a TTY, and say how to install a chooser.
+    local candidate
+    for candidate in "$HOME/Downloads"/*.exe "$HOME/Downloads"/*.msi \
+                     "$HOME/Desktop"/*.exe "$HOME/.local/bin"/*.AppImage; do
+      [ -e "$candidate" ] && picked="$candidate" && break
+    done
+    if [ -z "$picked" ]; then
+      wizard_set ERROR "No file chooser found (sudo pacman -S zenity) — or just double-click any .exe."
+      continuity_warn "install a file chooser (sudo pacman -S zenity), or run: continuity-run /path/to/app.exe"
+      return 1
+    fi
+    continuity_info "no file chooser installed; using $picked"
+  fi
+
+  [ -n "$picked" ] || return 1
+  printf '%s\n' "$picked"
+}
+
+cmd_install_exe() {
+  local file="${1:-}"
+  if [ -z "$file" ]; then
+    file="$(cmd_pick_exe)" || return 1
+  fi
+  [ -e "$file" ] || continuity_die "no such file: $file"
+  local name
+  name="$(continuity_slug_for_file "$file")"
+
+  wizard_set APP_NAME "$name"
+  wizard_set APP_PATH "$file"
+  wizard_set APP_STATE running
+  wizard_set ERROR ""
+
+  # Detached: the wizard must stay responsive while a game installer runs, and
+  # some installers take many minutes.
+  : >"$INSTALL_LOG"
+  if continuity_have setsid; then
+    setsid "$RUN_BIN" --installer --name "$name" "$file" >>"$INSTALL_LOG" 2>&1 &
+  else
+    "$RUN_BIN" --installer --name "$name" "$file" >>"$INSTALL_LOG" 2>&1 &
+  fi
+  printf '%s\n' "$!" >"$APP_PID_FILE"
+  continuity_log "wizard: installing $file as prefix '$name' (pid $!)"
+  continuity_info "installing '$name' — output: $INSTALL_LOG"
+  printf 'prefix: %s\n' "$(continuity_prefix_wine_dir "$name")"
+}
+
+# Poll target for the Eww window: keeps APP_STATE honest without blocking.
+refresh_app_state() {
+  [ "$(wizard_get APP_STATE)" = "running" ] || return 0
+  local pid
+  pid="$(cat "$APP_PID_FILE" 2>/dev/null || echo)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$APP_PID_FILE"
+  local name
+  name="$(wizard_get APP_NAME)"
+  # Launchers are what "installed" means here: if the prefix has executables
+  # registered, the app is usable from the dock and the app drawer.
+  if [ -n "$name" ] && { [ -d "$(continuity_prefix_dir "$name")/pfx/drive_c" ] || [ -d "$(continuity_prefix_dir "$name")/drive_c" ]; }; then
+    if [ -z "$(continuity-prefix launchers "$name" --list 2>/dev/null)" ]; then
+      continuity-prefix launchers "$name" --auto >/dev/null 2>&1 || true
+    fi
+    wizard_set APP_STATE installed
+  else
+    wizard_set APP_STATE failed
+    wizard_set ERROR "The installer did not create a prefix — see $INSTALL_LOG"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Balanced / Gaming
+# ---------------------------------------------------------------------------
+cmd_set_mode() {
+  local mode="${1:?usage: continuity-wizard set-mode balanced|gaming}"
+  case "$mode" in
+    balanced|gaming) ;;
+    *) continuity_die "unknown mode '$mode' (want: balanced|gaming)" ;;
+  esac
+
+  # 1. remember it across sessions in environment.conf, preserving the file's
+  #    comments (it is documentation as much as configuration).
+  if [ ! -e "$CONFIG_FILE" ]; then
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    printf '# Written by continuity-wizard\nCONTINUITY_START_IN_GAMING_MODE=0\n' >"$CONFIG_FILE"
+  fi
+  local want=0
+  [ "$mode" = "gaming" ] && want=1
+  if grep -qE '^[[:space:]]*#?[[:space:]]*CONTINUITY_START_IN_GAMING_MODE=' "$CONFIG_FILE"; then
+    sed -i -E "s|^[[:space:]]*#?[[:space:]]*CONTINUITY_START_IN_GAMING_MODE=.*|CONTINUITY_START_IN_GAMING_MODE=${want}|" "$CONFIG_FILE"
+  else
+    printf '\n# Set by the first-run wizard (%s). 1 = start every session lean.\nCONTINUITY_START_IN_GAMING_MODE=%s\n' \
+      "$mode" "$want" >>"$CONFIG_FILE"
+  fi
+  wizard_set MODE "$mode"
+
+  # 2. apply it to the session that is running right now.
+  if [ -x /usr/local/bin/continuity-gaming-mode ] || continuity_have continuity-gaming-mode; then
+    if [ "$mode" = "gaming" ]; then
+      continuity-gaming-mode on --quiet || continuity_warn "could not apply gaming mode right now"
+    else
+      continuity-gaming-mode off --quiet || continuity_warn "could not restore the desktop look right now"
+    fi
+  fi
+  continuity_log "wizard: default mode = $mode"
+  continuity_ok "default mode: $mode"
+  if [ "$mode" = "gaming" ]; then
+    printf 'Every session will now start lean (Super+G toggles it back at any time).\n'
+  else
+    printf 'Every session starts with animations and the full shell.\n'
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# region — locale, keyboard, time zone, Wi-Fi
+# ---------------------------------------------------------------------------
+# The tools are looked up the same way continuity-run is: the installed copy
+# first, then PATH, so an in-tree run works before install.sh has ever run.
+tool_bin() {
+  local name="$1" var="$2" override self_dir
+  eval "override=\${$var:-}"
+  if [ -n "$override" ]; then printf '%s' "$override"; return 0; fi
+  if [ -x "/usr/local/bin/$name" ]; then printf '%s' "/usr/local/bin/$name"; return 0; fi
+  # In-tree runs (the offline suite, or a checkout before install.sh has run)
+  # look beside this script before falling back to PATH.
+  self_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd || printf '')"
+  if [ -n "$self_dir" ] && [ -x "$self_dir/$name" ]; then printf '%s' "$self_dir/$name"; return 0; fi
+  printf '%s' "$name"
+}
+REGION_BIN="$(tool_bin continuity-region CONTINUITY_REGION_BIN)"
+SHAKEDOWN_BIN="$(tool_bin continuity-shakedown CONTINUITY_SHAKEDOWN_BIN)"
+TRANSFER_BIN="$(tool_bin continuity-export CONTINUITY_EXPORT_BIN)"
+
+have_tool() { [ -x "$1" ] || continuity_have "$1"; }
+
+# One field from `continuity-region show`: KEY<TAB>VALUE<TAB>SOURCE.
+region_field() {
+  have_tool "$REGION_BIN" || return 0
+  "$REGION_BIN" show 2>/dev/null \
+    | awk -F'\t' -v k="$1" '$1==k { print $2; exit }' || true
+}
+
+refresh_region() {
+  local locale keymap variant tz ssid summary
+  locale="$(region_field locale)"
+  keymap="$(region_field keymap)"
+  variant="$(region_field variant)"
+  tz="$(region_field timezone)"
+  ssid="$(region_field wifi_ssid)"
+  wizard_set REGION_LOCALE "$locale"
+  wizard_set REGION_KEYMAP "${keymap}${variant:+ ($variant)}"
+  wizard_set REGION_TIMEZONE "$tz"
+  wizard_set REGION_WIFI "$ssid"
+  if ! have_tool "$REGION_BIN"; then
+    summary="continuity-region is not installed here."
+    wizard_set ERROR "continuity-region is missing — run: sudo ./install.sh --system"
+  else
+    summary="Locale ${locale:-unset} · keyboard ${keymap:-unset} · ${tz:-time zone unset}"
+    wizard_set ERROR ""
+  fi
+  wizard_set REGION_SUMMARY "$summary"
+}
+
+region_fail() {
+  wizard_set ERROR "continuity-region is missing — run: sudo ./install.sh --system"
+  continuity_warn "continuity-region is not available; set this up by hand instead"
+  return 1
+}
+
+# A chooser that works with whatever is installed, and says so when nothing is.
+# The list arrives on stdin so the same helper serves locales, keymaps, zones
+# and Wi-Fi networks without four copies of the same zenity incantation.
+pick_from_list() {
+  local title column prompt entry
+  title="$1"; column="$2"; prompt="$3"
+  if continuity_have zenity; then
+    zenity --list --title="$title" --column="$column" --text="$prompt" \
+      --width=560 --height=520 --hide-header 2>/dev/null || true
+  elif continuity_have rofi; then
+    rofi -dmenu -i -p "$title" 2>/dev/null || true
+  else
+    # No chooser: consume the list so the producer never sees a SIGPIPE, and
+    # tell the caller to fall back to autodetection.
+    cat >/dev/null 2>&1 || true
+    return 1
+  fi
+}
+
+cmd_pick_locale() {
+  have_tool "$REGION_BIN" || region_fail
+  local choice list
+  list="$("$REGION_BIN" list-locales 2>/dev/null | grep -v '@' || true)"
+  if [ -z "$list" ]; then
+    wizard_set ERROR "no locale list available — systemd (localectl) is missing."
+    continuity_warn "no locale list (localectl/systemd is not installed) — keeping the current locale"
+    return 1
+  fi
+  if ! choice="$(printf '%s\n' "$list" | pick_from_list 'Language and region' 'Locale' 'Pick the locale for this machine. en_GB.UTF-8 and en_US.UTF-8 are the usual choices for English.')"; then
+    # No graphical chooser: keep what the machine already has rather than
+    # leaving the step silently unset.
+    continuity_info "no chooser installed (zenity or rofi) — keeping the detected locale"
+    cmd_autodetect
+    return 0
+  fi
+  [ -n "$choice" ] || return 0
+  "$REGION_BIN" locale "$choice" || { wizard_set ERROR "could not set the locale to $choice"; return 1; }
+  refresh_region
+  wizard_set ERROR ""
+  printf 'Locale set to %s\n' "$choice"
+}
+
+cmd_pick_keymap() {
+  have_tool "$REGION_BIN" || region_fail
+  local choice list
+  list="$("$REGION_BIN" list-keymaps 2>/dev/null | grep -v '^[0-9]' || true)"
+  if [ -z "$list" ]; then
+    wizard_set ERROR "no keymap list available — systemd (localectl) is missing."
+    continuity_warn "no keymap list (localectl/systemd is not installed) — keeping the current layout"
+    return 1
+  fi
+  if ! choice="$(printf '%s\n' "$list" | pick_from_list 'Keyboard layout' 'Layout' 'A wrong layout here makes everything after it unpleasant. us, gb, de, fr, es are the usual ones.')"; then
+    continuity_info "no chooser installed (zenity or rofi) — keeping the detected layout"
+    cmd_autodetect
+    return 0
+  fi
+  [ -n "$choice" ] || return 0
+  "$REGION_BIN" keymap "$choice" || { wizard_set ERROR "could not set the keyboard layout to $choice"; return 1; }
+  refresh_region
+  wizard_set ERROR ""
+  printf 'Keyboard layout set to %s (Hyprland picks it up on the next session)\n' "$choice"
+}
+
+cmd_pick_timezone() {
+  have_tool "$REGION_BIN" || region_fail
+  local choice list
+  list="$("$REGION_BIN" list-timezones 2>/dev/null || true)"
+  if [ -z "$list" ]; then
+    wizard_set ERROR "no time zone list available — systemd (timedatectl) is missing."
+    continuity_warn "no time zone list (systemd is not installed) — keeping the current zone"
+    return 1
+  fi
+  if ! choice="$(printf '%s\n' "$list" | pick_from_list 'Time zone' 'Zone' 'Area/City, e.g. Europe/London.')"; then
+    continuity_info "no chooser installed (zenity or rofi) — keeping the detected zone"
+    cmd_autodetect
+    return 0
+  fi
+  [ -n "$choice" ] || return 0
+  "$REGION_BIN" timezone "$choice" || { wizard_set ERROR "could not set the time zone to $choice"; return 1; }
+  refresh_region
+  wizard_set ERROR ""
+  printf 'Time zone set to %s\n' "$choice"
+}
+
+cmd_autodetect() {
+  have_tool "$REGION_BIN" || region_fail
+  "$REGION_BIN" autodetect --apply || { wizard_set ERROR "could not apply the detected settings"; return 1; }
+  refresh_region
+  wizard_set ERROR ""
+  printf 'Applied what this machine already reports.\n'
+}
+
+cmd_wifi_join() {
+  have_tool "$REGION_BIN" || region_fail
+  if ! continuity_have nmcli; then
+    wizard_set ERROR "NetworkManager is not installed — connect with whatever this machine has."
+    return 1
+  fi
+  local scan ssid pass list
+  scan="$("$REGION_BIN" wifi scan 2>/dev/null || true)"
+  if [ -z "$scan" ]; then
+    wizard_set ERROR "no Wi-Fi networks found (is Wi-Fi switched on?)"
+    return 1
+  fi
+  list="$(printf '%s\n' "$scan" | awk -F'\t' 'NF && !seen[$1]++ { print $1 }' || true)"
+  if ! ssid="$(printf '%s\n' "$list" | pick_from_list 'Wi-Fi' 'Network' 'Pick a network to join.')"; then
+    continuity_info "no chooser installed — join with: nmcli dev wifi connect <ssid>"
+    return 0
+  fi
+  [ -n "$ssid" ] || return 0
+
+  # The passphrase is asked for by the UI and piped straight into the tool's
+  # stdin: it is never an argument, so it cannot turn up in ps or a log.
+  if continuity_have zenity; then
+    pass="$(zenity --password --title="Wi-Fi: $ssid" 2>/dev/null || true)"
+  else
+    printf 'Password for %s (empty for an open network): ' "$ssid" >&2
+    IFS= read -rs pass || pass=""
+    printf '\n' >&2
+  fi
+  if printf '%s\n' "$pass" | "$REGION_BIN" wifi connect "$ssid" >/dev/null 2>&1; then
+    unset pass
+    refresh_region
+    wizard_set ERROR ""
+    continuity_ok "joined '$ssid'"
+  else
+    unset pass
+    wizard_set ERROR "Could not join '$ssid' — check the password and try again."
+    continuity_warn "joining '$ssid' failed; run it by hand to see why: continuity-region wifi connect '$ssid'"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# shakedown — will Windows games actually run on this machine?
+# ---------------------------------------------------------------------------
+# `continuity-shakedown` exits non-zero when a hard check fails, so every call
+# here captures its status rather than letting `set -e` end the wizard.
+refresh_shakedown() {
+  local out fixes pass=0 warn=0 fail=0 skip=0 headline="" summary="" line status rest key detail
+  local fail_key=""
+  if ! have_tool "$SHAKEDOWN_BIN"; then
+    wizard_set SHAKEDOWN_STATE unknown
+    wizard_set SHAKEDOWN_SUMMARY "continuity-shakedown is not installed here."
+    return 0
+  fi
+  out="$("$SHAKEDOWN_BIN" 2>/dev/null || true)"
+  while IFS= read -r line; do
+    status="${line%% *}"
+    rest="${line#* }"
+    key="${rest%% *}"
+    detail="${rest#* }"
+    case "$status" in
+      PASS) pass=$((pass + 1)) ;;
+      WARN) warn=$((warn + 1)); [ -n "$headline" ] || headline="$key: $detail" ;;
+      FAIL)
+        if [ "$fail" = "0" ]; then headline="$key: $detail"; fail_key="$key"; fi
+        fail=$((fail + 1))
+        ;;
+      SKIP) skip=$((skip + 1)) ;;
+      SUMMARY) summary="$rest" ;;
+      *) ;;
+    esac
+  done <<<"$out"
+  # Prefer the remedy for the check that actually failed: the report is ordered
+  # by category, so the first FIX line in it can easily belong to a mere warning.
+  fixes="$("$SHAKEDOWN_BIN" --fix 2>/dev/null \
+    | awk -v want="$fail_key" '/^FIX / { k = $2; sub(/^FIX [a-z0-9_]+ /, ""); if (k == want || want == "") { print; exit } }' || true)"
+  # A clean machine has no headline of its own; saying so beats rendering an
+  # empty bullet on the card.
+  [ -n "$headline" ] || headline="Nothing to fix — this machine is ready for games."
+  wizard_set SHAKEDOWN_FAIL "$fail"
+  wizard_set SHAKEDOWN_WARN "$warn"
+  wizard_set SHAKEDOWN_HEADLINE "$headline"
+  wizard_set SHAKEDOWN_FIX "$fixes"
+  if [ "$fail" -gt 0 ]; then
+    wizard_set SHAKEDOWN_STATE fail
+  elif [ "$warn" -gt 0 ]; then
+    wizard_set SHAKEDOWN_STATE warn
+  else
+    wizard_set SHAKEDOWN_STATE pass
+  fi
+  wizard_set SHAKEDOWN_SUMMARY "${summary:-$pass pass, $warn warn, $fail fail}"
+}
+
+cmd_shakedown() {
+  have_tool "$SHAKEDOWN_BIN" || {
+    wizard_set ERROR "continuity-shakedown is missing — run: sudo ./install.sh --system"
+    return 1
+  }
+  refresh_shakedown
+  wizard_set ERROR ""
+  case "${1:-}" in
+    --probe)
+      # The honest test: actually start a Windows program in a throwaway prefix.
+      continuity_info "running the live probe (this launches a real Windows program)"
+      "$SHAKEDOWN_BIN" --probe || continuity_warn "the probe did not pass — see the report above"
+      refresh_shakedown
+      ;;
+    *) cat <<EOF
+$(wizard_get SHAKEDOWN_SUMMARY)
+$( [ -n "$(wizard_get SHAKEDOWN_HEADLINE)" ] && printf '%s\n' "$(wizard_get SHAKEDOWN_HEADLINE)" )
+$( [ -n "$(wizard_get SHAKEDOWN_FIX)" ] && printf 'fix: %s\n' "$(wizard_get SHAKEDOWN_FIX)" )
+EOF
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# transfer — carry a whole setup to (or from) another machine
+# ---------------------------------------------------------------------------
+transfer_fail() {
+  wizard_set ERROR "continuity-export is missing — run: sudo ./install.sh --system"
+  continuity_warn "continuity-export is not available; the archive can be made by hand"
+  return 1
+}
+
+cmd_transfer_export() {
+  have_tool "$TRANSFER_BIN" || transfer_fail
+  local archive
+  archive="$HOME/continuity-setup-$(uname -n 2>/dev/null || printf 'machine')-$(date +%Y-%m-%d).tar.zst"
+  if [ -e "$archive" ]; then
+    archive="${archive%.tar.zst}-$(date +%H%M).tar.zst"
+  fi
+  if "$TRANSFER_BIN" export --out "$archive" >/dev/null 2>&1; then
+    wizard_set TRANSFER_STATE exported
+    wizard_set TRANSFER_ARCHIVE "$archive"
+    wizard_set TRANSFER_SUMMARY "Saved to $(basename "$archive")"
+    wizard_set ERROR ""
+    continuity_ok "setup exported to $archive"
+  else
+    wizard_set TRANSFER_STATE failed
+    wizard_set ERROR "The export failed — run 'continuity-export export' to see why."
+    return 1
+  fi
+}
+
+# The first export the user has lying around, which is what "move my setup"
+# means in practice: the file is usually already on the desktop or in $HOME.
+newest_archive() {
+  local f newest=""
+  for f in "$HOME"/continuity-setup-*.tar.zst "$HOME"/continuity-setup-*.tar.gz \
+           "$HOME/Desktop"/continuity-setup-*.tar.zst "$HOME/Downloads"/continuity-setup-*.tar.zst; do
+    [ -e "$f" ] || continue
+    newest="$f"
+  done
+  [ -n "$newest" ] && printf '%s\n' "$newest"
+  return 0
+}
+
+cmd_pick_archive() {
+  local picked=""
+  if continuity_have zenity; then
+    picked="$(zenity --file-selection --title='Choose a ContinuityOS setup archive' \
+      --filename="$HOME/" --file-filter='ContinuityOS setup | continuity-setup-*.tar.*' \
+      2>/dev/null || true)"
+  fi
+  [ -n "$picked" ] || picked="$(newest_archive)"
+  [ -n "$picked" ] || return 1
+  printf '%s\n' "$picked"
+}
+
+cmd_transfer_import() {
+  have_tool "$TRANSFER_BIN" || transfer_fail
+  local archive="${1:-}"
+  if [ -z "$archive" ]; then
+    archive="$(cmd_pick_archive)" || {
+      wizard_set ERROR "No setup archive found — put continuity-setup-*.tar.zst in your home folder."
+      return 1
+    }
+  fi
+  [ -e "$archive" ] || { wizard_set ERROR "no such archive: $archive"; return 1; }
+
+  # Show the plan before touching anything: a merge can add launchers, and the
+  # user is entitled to see what it will do to a machine they just set up.
+  local plan
+  plan="$("$TRANSFER_BIN" import "$archive" --dry-run 2>&1 || true)"
+  if continuity_have zenity; then
+    printf '%s\n' "$plan" >"$CONTINUITY_STATE_DIR/transfer-plan.txt"
+    if ! zenity --text-info --title='What will be imported' --width=700 --height=520 \
+         --filename="$CONTINUITY_STATE_DIR/transfer-plan.txt" --ok-label='Import' 2>/dev/null; then
+      rm -f "$CONTINUITY_STATE_DIR/transfer-plan.txt"
+      continuity_info "import cancelled"
+      return 0
+    fi
+    rm -f "$CONTINUITY_STATE_DIR/transfer-plan.txt"
+  else
+    printf '%s\n' "$plan"
+  fi
+
+  if "$TRANSFER_BIN" import "$archive" --yes >/dev/null 2>&1; then
+    wizard_set TRANSFER_STATE imported
+    wizard_set TRANSFER_ARCHIVE "$archive"
+    wizard_set TRANSFER_SUMMARY "Imported from $(basename "$archive")"
+    wizard_set ERROR ""
+    continuity_ok "setup imported from $archive"
+  else
+    wizard_set TRANSFER_STATE failed
+    wizard_set ERROR "The import failed — run 'continuity-export import $archive' to see why."
+    return 1
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# navigation and lifecycle
+# ---------------------------------------------------------------------------
+page_index() {
+  local page="$1" i=0
+  for p in "${PAGES[@]}"; do
+    [ "$p" = "$page" ] && { printf '%s' "$i"; return 0; }
+    i=$((i+1))
+  done
+  printf '0'
+}
+
+cmd_start() {
+  local force=0
+  [ "${1:-}" = "--force" ] && force=1
+  if [ -e "$DONE_FILE" ] && [ "$force" != "1" ]; then
+    continuity_info "setup was already completed ($DONE_FILE) — use 'continuity-wizard start --force' to reopen"
+    return 0
+  fi
+  wizard_init_state
+  wizard_set ERROR ""
+  # A stored "done" page without the completion marker (the user closed the last
+  # page) would reopen a finished-looking wizard, so send them back to the start.
+  if [ "$(wizard_get PAGE)" = "done" ] && [ ! -e "$DONE_FILE" ]; then
+    wizard_set PAGE welcome
+  fi
+  show_page "$(wizard_get PAGE)"
+  if [ "$(wizard_get PAGE)" = "welcome" ]; then
+    refresh_steam_summary
+  fi
+}
+
+cmd_show_once() {
+  [ -e "$DONE_FILE" ] && return 0
+  cmd_start
+}
+
+cmd_next() {
+  local page idx
+  page="$(wizard_get PAGE)"
+  idx="$(page_index "$page")"
+  if [ "$page" = "steam" ]; then refresh_steam_summary; fi
+  if [ "$page" = "windows" ]; then refresh_app_state; fi
+  if [ "$page" = "done" ] || [ "$idx" -ge "$(( ${#PAGES[@]} - 1 ))" ]; then
+    cmd_finish
+    return 0
+  fi
+  show_page "${PAGES[$((idx+1))]}"
+}
+
+cmd_back() {
+  local page idx
+  page="$(wizard_get PAGE)"
+  [ "$page" = "welcome" ] && return 0
+  idx="$(page_index "$page")"
+  show_page "${PAGES[$((idx-1))]}"
+}
+
+cmd_finish() {
+  printf 'completed %s\n' "$(date -Is)" >"$DONE_FILE"
+  chmod 644 "$DONE_FILE" 2>/dev/null || true
+  wizard_set PAGE done
+  wizard_set ERROR ""
+  # Make sure the last page is visible before closing, so "done" is not a blink.
+  if [ "$HAVE_EWW" = "1" ] && eww_ready; then
+    close_windows
+    eww open wizard-done >/dev/null 2>&1 || true
+  fi
+  continuity_log "wizard: completed"
+  continuity_ok "setup complete — welcome to ${CONTINUITY_NAME}"
+}
+
+cmd_close() {
+  # Closing from the LAST page is the same intent as pressing Finish: the user
+  # walked the whole flow. Without this, a window closed by the compositor (or the
+  # done card's other button) left no completion marker, so show-once reopened the
+  # wizard at the next login and the user could never be rid of it. Closing from
+  # any earlier page is still "not now" and marks nothing.
+  if [ "$(wizard_get PAGE)" = "done" ] && [ ! -e "$DONE_FILE" ]; then
+    printf 'completed %s (closed on the last page)\n' "$(date -Is)" >"$DONE_FILE"
+    chmod 644 "$DONE_FILE" 2>/dev/null || true
+    continuity_log "wizard: completed (closed on the last page)"
+  fi
+  close_windows
+  continuity_info "wizard closed (reopen any time: continuity-wizard start)"
+}
+
+cmd_reset() {
+  rm -f "$DONE_FILE" "$APP_PID_FILE"
+  default_state >"$STATE_FILE"
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
+  [ "${1:-}" = "--purge-log" ] && rm -f "$INSTALL_LOG"
+  continuity_ok "wizard state reset — it will open again at the next login"
+}
+
+cmd_state() {
+  wizard_init_state
+  refresh_app_state
+  if [ "${1:-}" = "--json" ]; then
+    local first=1 key value
+    printf '{'
+    while IFS='=' read -r key value; do
+      [ -n "$key" ] || continue
+      value="${value//\\/\\\\}"
+      value="${value//\"/\\\"}"
+      [ "$first" = "1" ] || printf ','
+      first=0
+      printf '"%s":"%s"' "$key" "$value"
+    done <"$STATE_FILE"
+    printf '}\n'
+  else
+    cat "$STATE_FILE"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# dispatch
+# ---------------------------------------------------------------------------
+ACTION="${1:-}"
+shift || true
+case "$ACTION" in
+  start|open)   cmd_start "$@" ;;
+  show-once)    cmd_show_once ;;
+  goto)         refresh_steam_summary; show_page "${1:?usage: continuity-wizard goto <page>}" ;;
+  next)         cmd_next ;;
+  back|previous) cmd_back ;;
+  get)
+    refresh_app_state
+    # Two values are computed rather than stored: the greeting depends on the
+    # clock, and the prefix root on the environment.
+    case "${1:-}" in
+      GREETING|greeting) wizard_greeting ;;
+      PREFIX_ROOT|prefix-root) printf '%s\n' "$CONTINUITY_PREFIX_ROOT" ;;
+      "") continuity_die "usage: continuity-wizard get <key>" ;;
+      *) wizard_get "$1" ;;
+    esac
+    ;;
+  state)        cmd_state "$@" ;;
+  autodetect)     cmd_autodetect ;;
+  pick-locale)    cmd_pick_locale ;;
+  pick-keymap)    cmd_pick_keymap ;;
+  pick-timezone)  cmd_pick_timezone ;;
+  wifi-join)      cmd_wifi_join ;;
+  shakedown)      cmd_shakedown "$@" ;;
+  transfer-export) cmd_transfer_export ;;
+  transfer-import) cmd_transfer_import "$@" ;;
+  scan-steam)   cmd_scan_steam "$@" ;;
+  import-steam) cmd_import_steam "$@" ;;
+  open-prefix)
+    refresh_app_state
+    name="$(wizard_get APP_NAME)"
+    [ -n "$name" ] || continuity_die "nothing installed yet"
+    exec continuity-prefix browse "$name"
+    ;;
+  pick-exe)     cmd_pick_exe ;;
+  install-exe)  cmd_install_exe "$@" ;;
+  set-mode)     cmd_set_mode "$@" ;;
+  finish)       cmd_finish ;;
+  close)        cmd_close ;;
+  reset)        cmd_reset "$@" ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

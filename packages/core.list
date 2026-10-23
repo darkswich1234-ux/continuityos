@@ -1,0 +1,96 @@
+# ContinuityOS — core system packages (official repos)
+# Read by install.sh: one package per line, '#' comments and blanks ignored.
+# Multilib packages (wine, lib32-*) require [multilib] to be enabled;
+# install.sh does that automatically when it is missing.
+
+# --- kernel ------------------------------------------------------------------
+# ContinuityOS targets linux-zen for its throughput-oriented scheduler config.
+# Installing it does NOT change your boot default: it is added alongside the
+# kernel you already run, so pick it in the bootloader when you are ready. On an
+# ISO install it is the primary entry. linux-zen-headers is needed to build the
+# NVIDIA DKMS module against it.
+linux-zen
+linux-zen-headers
+
+# --- base tooling -------------------------------------------------------------
+base-devel
+git
+zstd
+curl
+wget
+rsync
+jq
+unzip
+p7zip
+python
+librsvg            # rsvg-convert: turns the SVG wallpapers into PNG for hyprpaper
+man-db
+less
+nano
+vim
+htop
+btop
+ripgrep
+fd
+fzf
+bash-completion
+starship
+
+# --- audio, bluetooth, power --------------------------------------------------
+pipewire
+pipewire-alsa
+pipewire-pulse
+pipewire-jack
+wireplumber
+alsa-utils
+pavucontrol
+bluez
+bluez-utils
+brightnessctl
+playerctl
+power-profiles-daemon      # drives the drawer's Performance/Balanced switching
+
+# --- networking ---------------------------------------------------------------
+networkmanager
+network-manager-applet
+nm-connection-editor
+
+# --- desktop integration (portals, mime, session) -----------------------------
+polkit
+polkit-gnome
+xdg-utils
+xdg-user-dirs
+xdg-desktop-portal
+xdg-desktop-portal-gtk
+xdg-desktop-portal-hyprland
+shared-mime-info
+desktop-file-utils
+hicolor-icon-theme
+# Zero-prompt boot. greetd's [initial_session] runs the ContinuityOS session once,
+# before any greeter is shown, so a machine comes up on the desktop instead of on
+# a TTY login followed by a session chooser. greetd-tuigreet is only ever the
+# logout screen — the way back in when the desktop itself is what broke.
+# Both live in [extra], so no AUR helper is needed to boot.
+greetd
+greetd-tuigreet
+
+# --- sandboxed apps + AppImage management ------------------------------------
+flatpak
+
+# --- fonts, icons, cursor -----------------------------------------------------
+noto-fonts
+noto-fonts-emoji
+ttf-jetbrains-mono-nerd    # Waybar/Eww glyphs; falls back to text without it
+papirus-icon-theme
+adwaita-icon-theme
+gnome-themes-extra         # Adwaita-dark, referenced by the GTK settings
+
+# --- utilities ----------------------------------------------------------------
+zenity                     # file chooser for the first-run wizard (.exe picker)
+wl-clipboard
+grim
+slurp
+cliphist
+file-roller
+archlinux-keyring
+rate-mirrors

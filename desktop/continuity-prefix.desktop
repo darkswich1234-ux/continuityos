@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Windows Applications
+GenericName=Prefix Manager
+Comment=Inspect, open and uninstall your isolated Windows application prefixes
+Exec=/usr/local/bin/continuity-prefix manage
+TryExec=/usr/local/bin/continuity-prefix
+Icon=windows-app
+Terminal=false
+StartupNotify=true
+Categories=System;Settings;Utility;Wine;
+Keywords=wine;prefix;proton;uninstall;windows;

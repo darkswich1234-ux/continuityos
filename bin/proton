@@ -1,0 +1,254 @@
+#!/usr/bin/env bash
+# proton — run Windows programs with Proton on any Linux desktop.
+#
+# This is the standalone face of the ContinuityOS engine. One command, one
+# Windows .exe, one isolated prefix:
+#
+#   ~/.local/share/universal-prefixes/<app-slug>/
+#
+# Proton and the Steam Linux Runtime are bootstrapped by umu-run, so nothing
+# here needs Steam, a custom distribution, a display manager or root. Install it
+# with standalone/install.sh; remove it with `proton uninstall`.
+#
+#   proton setup.exe                 run in its own prefix
+#   proton --installer setup.exe     install, then register launchers
+#   proton --native tool.exe         plain system Wine instead of Proton
+#   proton list                      the prefixes on this machine
+#   proton info <slug>               details, executables, launchers
+#   proton rm <slug>                 remove a prefix and its launchers
+#   proton check                     will Windows games actually run here?
+#   proton version                   what engine is installed where
+#   proton uninstall [--purge]       remove this command and its files
+set -euo pipefail
+
+PROG="${0##*/}"
+SELF="$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")"
+SELF_DIR="$(cd -- "$(dirname -- "$SELF")" 2>/dev/null && pwd || printf '%s' "${SELF%/*}")"
+# umu-run is installed next to this command. Put that directory first so the
+# engine works even in a shell whose PATH has not picked it up yet (the first
+# run, a desktop launcher, a cron job).
+export PATH="$SELF_DIR:$PATH"
+
+# --- locate the engine --------------------------------------------------------
+# The tools are installed side by side (bin/), with the shared library either in
+# the same directory (in-tree) or in ../lib/continuity (installed). Try the
+# sibling first so a checkout works without installing anything.
+_find() {
+  local name="$1" p
+  for p in \
+    "$SELF_DIR/$name" \
+    "$SELF_DIR/../lib/continuity/$name" \
+    "$SELF_DIR/../lib/$name" \
+    /usr/local/bin/"$name" \
+    /usr/bin/"$name"; do
+    [ -n "$p" ] && [ -f "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+  done
+  p="$(command -v "$name" 2>/dev/null || true)"
+  [ -n "$p" ] && { printf '%s' "$p"; return 0; }
+  return 1
+}
+
+RUN_BIN="$(_find continuity-run || true)"
+PREFIX_BIN="$(_find continuity-prefix || true)"
+CHECK_BIN="$(_find continuity-shakedown || true)"
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$SELF_DIR/continuity-common.sh" \
+    "$SELF_DIR/../lib/continuity/continuity-common.sh" \
+    "$SELF_DIR/../lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+if [ -z "$_lib" ] || [ ! -r "$_lib" ]; then
+  echo "$PROG: cannot locate continuity-common.sh (set CONTINUITY_LIB)" >&2
+  exit 1
+fi
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+LIB_FILE="$_lib"
+
+usage() {
+  cat <<'EOF'
+proton — run Windows programs with Proton, on any Linux desktop
+
+USAGE
+  proton <file.exe|file.msi|file.bat|file.cmd|file.lnk> [app args...]
+  proton <command> [args]
+
+LAUNCHING
+  Every program gets its own prefix under
+  ~/.local/share/universal-prefixes/<slug>/, so one broken install never
+  touches the next one. The options are continuity-run's:
+
+    -n, --name NAME     prefix + launcher name (default: from the file name)
+    -i, --installer     install, then register launchers for what it created
+    -N, --native        use system Wine instead of Proton
+    --direct            host Proton build without UMU
+    -P, --proton PATH   select a Proton build (implies --direct)
+    --print-env         print the resolved environment and launch nothing
+    -h, --help          continuity-run's full option list
+
+MANAGING PREFIXES
+  list [--json] [--paths]        prefixes on this machine
+  info <slug>                    path, size, executables, launchers
+  path <slug>                    print the prefix directory
+  scan <slug> [--all]            launchable .exe inside the prefix
+  launchers <slug> [--auto]      create/list desktop launchers
+  rm <slug> [--yes]              delete the prefix and its launchers
+  export <slug> <file.tar.zst>   archive a prefix
+  import <file.tar.zst> [slug]   restore one
+  winetricks|protontricks|regedit|kill|browse <slug>
+
+CHECKS AND MAINTENANCE
+  check [--json] [--probe]       Vulkan, Wine, Proton, UMU readiness report
+  version                        engine, umu-run and prefix locations
+  uninstall [--purge] [--yes]    remove the command; --purge also removes
+                                 config and every prefix
+
+FIRST RUN
+  proton check                  # what is missing on this machine?
+  proton ~/Downloads/GameSetup.exe --installer
+EOF
+}
+
+need() {
+  local var="$1" what="$2" remediation="$3"
+  # shellcheck disable=SC2154
+  if [ -z "$(eval "printf '%s' \"\${$var:-}\"")" ]; then
+    continuity_error "$what is not installed next to this command."
+    printf '  fix: %s\n' "$remediation" >&2
+    exit 1
+  fi
+}
+
+exec_run() { need RUN_BIN "continuity-run" "re-run standalone/install.sh"; exec "$RUN_BIN" "$@"; }
+
+cmd_version() {
+  continuity_load_env
+  local umu
+  umu="$(command -v umu-run 2>/dev/null || true)"
+  printf 'proton %s (ContinuityOS engine, standalone)\n' "$CONTINUITY_VERSION"
+  printf 'continuity-run: %s\n' "${RUN_BIN:-missing}"
+  printf 'umu-run:        %s\n' "${umu:-missing}"
+  printf 'wine:           %s\n' "$(command -v wine 2>/dev/null || printf 'missing')"
+  printf 'prefixes:       %s\n' "$CONTINUITY_PREFIX_ROOT"
+  printf 'distribution:   %s\n' "$(continuity_family)"
+}
+
+cmd_uninstall() {
+  local purge=0 assume=0 a f
+  for a in "$@"; do
+    case "$a" in
+      --purge) purge=1 ;;
+      --yes|-y) assume=1 ;;
+      -h|--help) usage; exit 0 ;;
+      *) printf '%s: unknown option for uninstall: %s\n' "$PROG" "$a" >&2; exit 2 ;;
+    esac
+  done
+  continuity_load_env
+
+  if [ ! -w "$SELF_DIR" ]; then
+    continuity_die "cannot write to $SELF_DIR — re-run with: sudo $SELF uninstall $*"
+  fi
+
+  # umu-run lives here too when standalone/install.sh downloaded it, and the
+  # directory is one this project manages, so it goes with the rest.
+  local files=("$SELF_DIR/proton" "$SELF_DIR/continuity-run" \
+               "$SELF_DIR/continuity-prefix" "$SELF_DIR/continuity-shakedown" \
+               "$SELF_DIR/umu-run")
+  printf 'This removes:\n' >&2
+  for f in "${files[@]}"; do [ -e "$f" ] && printf '  %s\n' "$f" >&2; done
+  [ -e "$LIB_FILE" ] && printf '  %s\n' "$LIB_FILE" >&2
+  [ -e "${XDG_DATA_HOME:-$HOME/.local/share}/applications/continuity-wine.desktop" ] && \
+    printf '  %s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/applications/continuity-wine.desktop" >&2
+  if [ "$purge" = "1" ]; then
+    printf '  %s (configuration)\n' "$CONTINUITY_CONFIG_DIR" >&2
+    printf '  %s (every Windows prefix)\n' "$CONTINUITY_PREFIX_ROOT" >&2
+  else
+    printf 'Keeping %s and %s (add --purge to delete them).\n' \
+      "$CONTINUITY_CONFIG_DIR" "$CONTINUITY_PREFIX_ROOT" >&2
+  fi
+
+  if [ "$assume" != "1" ] && ! continuity_confirm "Remove the engine command?"; then
+    continuity_die "aborted"
+  fi
+
+  for f in "${files[@]}"; do [ -e "$f" ] && rm -f -- "$f"; done
+  [ -e "$LIB_FILE" ] && rm -f -- "$LIB_FILE"
+
+  # Desktop handler and its MIME defaults.
+  local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+  local mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
+  rm -f -- "$apps/continuity-wine.desktop"
+  if [ -r "$mimeapps" ]; then
+    grep -v 'continuity-wine.desktop' "$mimeapps" >"$mimeapps.continuity-tmp" 2>/dev/null && \
+      mv -- "$mimeapps.continuity-tmp" "$mimeapps"
+    rm -f -- "$mimeapps.continuity-tmp"
+  fi
+  continuity_have update-desktop-database && \
+    update-desktop-database "$apps" >/dev/null 2>&1 || true
+
+  # The PATH block the installer may have added (never anything else).
+  local rc
+  for rc in "$HOME/.profile" "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -r "$rc" ] || continue
+    grep -q '>>> continuity engine' "$rc" || continue
+    awk '
+      /# >>> continuity engine/ { skip = 1; next }
+      /# <<< continuity engine/ { skip = 0; next }
+      !skip
+    ' "$rc" >"$rc.continuity-tmp" && mv -- "$rc.continuity-tmp" "$rc"
+    rm -f -- "$rc.continuity-tmp"
+    continuity_info "removed the PATH block from $rc"
+  done
+
+  if [ "$purge" = "1" ]; then
+    rm -rf -- "$CONTINUITY_CONFIG_DIR" "$CONTINUITY_PREFIX_ROOT" \
+              "$CONTINUITY_STATE_DIR" "$CONTINUITY_LAUNCHER_DIR"
+  fi
+  continuity_ok "the engine is uninstalled"
+}
+
+# --- dispatch -----------------------------------------------------------------
+FIRST="${1:-}"
+case "$FIRST" in
+  ""|help|--help|-h) usage; exit 0 ;;
+  version|--version|-V) cmd_version; exit 0 ;;
+  uninstall) shift; cmd_uninstall "$@"; exit 0 ;;
+esac
+
+# An existing path always wins: `proton list` means the prefix list only when
+# there is no file called "list" to launch, and anything that looks like an
+# option belongs to the launcher.
+if [ -e "$FIRST" ] || [ "${FIRST#-}" != "$FIRST" ]; then
+  exec_run "$@"
+fi
+
+case "$FIRST" in
+  run|launch)
+    shift
+    [ "$#" -ge 1 ] || { usage >&2; exit 2; }
+    exec_run "$@"
+    ;;
+  list|info|path|root|scan|launchers|rm|remove|export|import|winetricks|protontricks|regedit|kill|browse|manage)
+    need PREFIX_BIN "continuity-prefix" "re-run standalone/install.sh"
+    SUB="$FIRST"
+    [ "$SUB" = "remove" ] && SUB="rm"
+    shift
+    exec "$PREFIX_BIN" "$SUB" "$@"
+    ;;
+  check|doctor)
+    need CHECK_BIN "continuity-shakedown" "re-run standalone/install.sh"
+    shift
+    exec "$CHECK_BIN" "$@"
+    ;;
+  *)
+    # Unknown words are passed through: continuity-run gives the error message,
+    # and a relative path without a slash ("game.exe") still works from here.
+    exec_run "$@"
+    ;;
+esac

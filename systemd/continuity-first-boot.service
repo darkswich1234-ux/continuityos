@@ -1,0 +1,25 @@
+[Unit]
+Description=ContinuityOS first boot provisioning
+Documentation=file:///usr/local/share/doc/continuityos/ARCHITECTURE.md
+# Runs exactly once per installation, on the first boot after install.sh --system
+# (or after an ISO install). The marker is created by ExecStartPost, so a failed
+# provisioning run is retried on the next boot instead of being silently lost.
+ConditionPathExists=!/var/lib/continuity/first-boot.done
+After=network-online.target local-fs.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# install.sh writes machine-wide choices here (mirror, target user, optional
+# components such as WINBOAT/ART CRAFT). Missing file is fine.
+EnvironmentFile=-/etc/continuity/install.conf
+ExecStart=/usr/local/bin/continuity-first-boot
+# Create the state directory and drop the marker only after a successful run.
+ExecStartPost=/usr/bin/install -d -m 0755 /var/lib/continuity
+ExecStartPost=/usr/bin/touch /var/lib/continuity/first-boot.done
+# First-boot steps include runtime seeding and Flatpak remote setup.
+TimeoutStartSec=900
+
+[Install]
+WantedBy=multi-user.target

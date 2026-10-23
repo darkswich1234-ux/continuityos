@@ -1,0 +1,32 @@
+# ContinuityOS — AUR extras (needs an AUR helper: yay or paru)
+# install.sh installs these only with --with-aur, and skips entries whose
+# component was not requested (winboat-bin needs --with-winboat,
+# freebuff-bin needs --with-freebuff). Failures here never abort the install.
+
+# --- illogical-impulse (ii) shell dependencies not in the official repos -----
+# ii's own packages are built from its pinned checkout (see docs/END4-PC.md);
+# these are its AUR-only runtime dependencies.
+wlogout                     # power menu
+breeze-plus                 # ii's Qt/KDE icon and cursor set
+darkly-bin                  # Qt widget style used by ii
+otf-space-grotesk          # ii font
+ttf-readex-pro              # ii font
+ttf-rubik-vf                # ii font
+ttf-twemoji                 # ii emoji font
+ttf-material-symbols-variable-git  # ii icon font
+
+# --- the compatibility engine -------------------------------------------------
+proton-ge-custom-bin        # Optional community Proton; upstream requires UMU outside Steam
+protonup-qt                 # GUI to fetch/update Proton-GE and Proton-CachyOS
+heroic-games-launcher-bin   # GOG/Epic/Amazon launcher; uses its own supported runner integration
+
+# --- ArtCraft (the native creative front end; early alpha — see docs) ---------
+photocraft                  # ArtCraft PhotoCraft (image editing, early alpha)
+filmcraft-git               # ArtCraft FilmCraft (video, in development)
+
+# --- requested integrations ---------------------------------------------------
+gearlever                   # AppImage manager — installed as a Flatpak by default,
+                            # this AUR entry is the fallback when flatpak is unwanted
+freebuff-bin                # Freebuff CLI (the desktop app ships as a Linux AppImage;
+                            # see docs/FREEBUFF.md)
+winboat-bin                 # container-based Windows app bridge (optional; needs docker)

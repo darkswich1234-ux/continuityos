@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# ContinuityOS — shell control: the quick-settings drawer, notification shade,
+# dock and the power menu.
+#
+#   continuity-panel toggle drawer           open/close the quick-settings drawer
+#   continuity-panel toggle notifications    open/close the notification shade
+#   continuity-panel open|close <name>       explicit control of one surface
+#   continuity-panel close                   close drawer + notifications
+#   continuity-panel hide-all                also hide the dock (gaming mode)
+#   continuity-panel show-dock
+#   continuity-panel reload                  reload the Eww config after an edit
+#   continuity-panel power [lock|suspend|hibernate|logout|reboot|shutdown]
+#   continuity-panel status                  what is running/visible
+#
+# Surfaces map to Eww windows defined in config/eww/eww.yuck:
+#   dock  drawer  notifications
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-panel: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+continuity_load_env
+EWW_CONFIG_DIR="${EWW_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/eww}"
+SURFACES="dock drawer notifications"
+# The first-run wizard is one window per step (see continuity-wizard show_page).
+WIZARD_WINDOWS="wizard wizard-region wizard-steam wizard-transfer wizard-windows \
+                wizard-shakedown wizard-mode wizard-done"
+
+usage() {
+  cat <<'EOF'
+continuity-panel — control the ContinuityOS shell surfaces
+
+USAGE
+  continuity-panel <command> [args]
+
+COMMANDS
+  toggle <drawer|notifications|dock>   Toggle a surface (drawer = quick settings)
+  open <surface>                       Open a surface (or 'all')
+  close [surface]                      Close drawer + notifications (or one surface)
+  show-dock                            Ensure the dock is visible
+  hide-all [--with-wizard]             Close drawer, notifications and dock
+  wizard [page]                        Reopen the first-run wizard at a step
+  region | shakedown | transfer        Open the wizard at that step
+  boot                                 What this machine does at boot (autologin?)
+  reload                               Reload the Eww configuration
+  power [lock|suspend|hibernate|logout|reboot|shutdown]
+                                       Power menu, or perform one action directly
+  status [--json]                      Report what is running
+
+SURFACES
+  drawer         Android-style quick settings (Wi-Fi, Bluetooth, audio, performance)
+  notifications  Notification shade
+  dock           Bottom overlay dock
+EOF
+}
+
+eww_bin() { command -v eww 2>/dev/null || true; }
+
+eww_running() { continuity_have pgrep && pgrep -x eww >/dev/null 2>&1; }
+
+# Ensure the daemon exists before talking to it; opening a window needs it.
+ensure_eww() {
+  [ -n "$(eww_bin)" ] || return 1
+  if ! eww_running; then
+    setsid eww daemon >/dev/null 2>&1 &
+    local i
+    for i in $(seq 1 20); do
+      eww_running && break
+      sleep 0.1
+    done
+  fi
+  return 0
+}
+
+is_open() {
+  local win="$1"
+  eww windows 2>/dev/null | tr ', ' '\n\n' | grep -qx "$win"
+}
+
+open_surface() {
+  local win="$1"
+  case " $SURFACES " in *" $win "*) ;; *) continuity_die "unknown surface '$win' (want: $SURFACES)" ;; esac
+  if ! ensure_eww; then
+    # A missing shell widget manager must not make a keybind or desktop entry
+    # look like a crash: warn, and let the caller carry on.
+    continuity_warn "eww is not installed — cannot open '$win' (sudo pacman -S eww)"
+    return 0
+  fi
+  # A surface may already be open; eww treats that as an error we do not care about.
+  eww open "$win" >/dev/null 2>&1 || eww open-many "$win" >/dev/null 2>&1 || true
+}
+
+close_surface() {
+  local win="$1"
+  [ -n "$(eww_bin)" ] || return 0
+  eww_running || return 0
+  eww close "$win" >/dev/null 2>&1 || true
+}
+
+toggle_surface() {
+  local win="$1"
+  [ -n "$(eww_bin)" ] && eww_running || { open_surface "$win"; return $?; }
+  if is_open "$win"; then close_surface "$win"; else open_surface "$win"; fi
+}
+
+power_menu() {
+  # The drawer's power buttons and the bar's power button share the widget
+  # script; fall back to an inline menu if the config is not installed.
+  local script="$EWW_CONFIG_DIR/scripts/power.sh"
+  if [ -x "$script" ]; then
+    exec "$script" "${1:-menu}"
+  fi
+  local action="${1:-menu}"
+  case "$action" in
+    lock)     if continuity_have hyprlock; then exec hyprlock; else exec loginctl lock-session; fi ;;
+    suspend)  exec systemctl suspend ;;
+    hibernate) exec systemctl hibernate ;;
+    logout)   if continuity_in_hyprland; then exec hyprctl dispatch exit; else exec loginctl terminate-session "${XDG_SESSION_ID:-}"; fi ;;
+    reboot)   exec systemctl reboot ;;
+    shutdown) exec systemctl poweroff ;;
+    menu|*)
+      if continuity_have rofi; then
+        choice="$(printf 'Lock\nSuspend\nLog out\nReboot\nShut down\n' | rofi -dmenu -i -p Power)" || exit 0
+        case "$choice" in
+          Lock) power_menu lock ;;
+          Suspend) power_menu suspend ;;
+          "Log out") power_menu logout ;;
+          Reboot) power_menu reboot ;;
+          "Shut down") power_menu shutdown ;;
+        esac
+      else
+        continuity_die "no power menu available (install rofi or avoid passing an action)"
+      fi
+      ;;
+  esac
+}
+
+ACTION="${1:-}"
+shift || true
+
+case "$ACTION" in
+  toggle)
+    win="${1:-drawer}"
+    # Opening the drawer should not leave the shade floating behind it.
+    if [ "$win" = "drawer" ] && ! { [ -n "$(eww_bin)" ] && eww_running && is_open drawer; }; then
+      close_surface notifications
+    fi
+    toggle_surface "$win"
+    ;;
+  open)
+    case "${1:-}" in
+      all) for s in $SURFACES; do open_surface "$s"; done ;;
+      "") continuity_die "usage: continuity-panel open <surface|all>" ;;
+      *) open_surface "$1" ;;
+    esac
+    ;;
+  close)
+    # Closing the "chrome" deliberately leaves the dock alone: the dock is the
+    # home screen affordance, not a notification surface.
+    if [ -n "${1:-}" ]; then close_surface "$1"; else close_surface drawer; close_surface notifications; fi
+    ;;
+  hide-all)
+    for s in $SURFACES; do close_surface "$s"; done
+    # The wizard is deliberately NOT closed by default: gaming mode calls
+    # hide-all, and a user who taps "Gaming" mid-setup should not watch the
+    # wizard vanish underneath them. Pass --with-wizard when you mean everything.
+    if [ "${1:-}" = "--with-wizard" ]; then
+      for w in $WIZARD_WINDOWS; do close_surface "$w"; done
+    fi
+    ;;
+  wizard)
+    # `continuity-panel wizard` reopens the flow where it left off;
+    # `continuity-panel wizard steam` jumps straight to one step (forcing is the
+    # point there: a completed flow would otherwise refuse to reopen).
+    if [ -n "${1:-}" ]; then
+      exec /usr/local/bin/continuity-wizard start --force
+    fi
+    exec /usr/local/bin/continuity-wizard start
+    ;;
+  wizard-page)
+    [ -n "${1:-}" ] || continuity_die "usage: continuity-panel wizard-page <welcome|region|steam|transfer|windows|shakedown|mode|done>"
+    exec /usr/local/bin/continuity-wizard goto "$1"
+    ;;
+  region|shakedown|transfer|steam|windows|mode)
+    # One step of the wizard, reached from anywhere (a dock tile, a terminal, a
+    # keybind) without walking the whole flow again.
+    exec /usr/local/bin/continuity-wizard goto "$ACTION"
+    ;;
+  boot)
+    # Quick Settings has no room for a boot story, so this reports it instead.
+    if [ -x /usr/local/bin/continuity-boot ]; then
+      exec /usr/local/bin/continuity-boot status
+    fi
+    continuity_die "continuity-boot is not installed (sudo ./install.sh --system)"
+    ;;
+  show-dock)
+    open_surface dock
+    ;;
+  reload)
+    if ensure_eww; then
+      eww reload >/dev/null 2>&1 && continuity_ok "eww configuration reloaded" || continuity_warn "eww reload failed (check ~/.config/eww)"
+    else
+      continuity_die "eww is not installed"
+    fi
+    # Wallpaper and bar also pick up config changes without a session restart.
+    continuity_hypr dispatch exec hyprpaper
+    continuity_hypr dispatch exec "pkill -SIGUSR2 waybar"
+    ;;
+  power) power_menu "${1:-menu}" ;;
+  status)
+    eww_state="stopped"; eww_running && eww_state="running"
+    waybar_state="stopped"; continuity_have pgrep && pgrep -x waybar >/dev/null 2>&1 && waybar_state="running"
+    dunst_state="stopped"; continuity_have pgrep && pgrep -x dunst >/dev/null 2>&1 && dunst_state="running"
+    open_list=""
+    if [ "$eww_state" = "running" ]; then
+      for s in $SURFACES; do is_open "$s" && open_list="$open_list $s"; done
+    fi
+    gaming=off
+    [ -f "$CONTINUITY_STATE_DIR/gaming-mode.enabled" ] && gaming=on
+    if [ "${1:-}" = "--json" ]; then
+      printf '{"eww":"%s","waybar":"%s","dunst":"%s","open":"%s","gaming_mode":"%s"}\n' \
+        "$eww_state" "$waybar_state" "$dunst_state" "${open_list# }" "$gaming"
+    else
+      printf 'Eww daemon:   %s\n' "$eww_state"
+      printf 'Waybar:       %s\n' "$waybar_state"
+      printf 'Dunst:        %s\n' "$dunst_state"
+      printf 'Open draws:   %s\n' "${open_list:- none}"
+      printf 'Gaming mode:  %s\n' "$gaming"
+    fi
+    ;;
+  -h|--help|help|"") usage ;;
+  *) usage >&2; exit 2 ;;
+esac

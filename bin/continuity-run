@@ -1,0 +1,376 @@
+#!/usr/bin/env bash
+# ContinuityOS Universal Windows Compatibility Engine — global .exe handler.
+#
+# Double-clicking any Windows executable runs this script (via
+# continuity-wine.desktop). It gives every application its own isolated prefix:
+#
+#   ~/.local/share/universal-prefixes/<slug>/drive_c/
+#
+# and launches it through UMU + Proton by default. Use --direct for an explicit
+# host Proton invocation, or --native for plain system Wine.
+#
+#   continuity-run mygame-setup.exe            # install into prefix "mygame-setup"
+#   continuity-run --name MyGame setup.exe     # ...into prefix "mygame"
+#   continuity-run --installer setup.exe       # install, then create launchers
+#   continuity-run --native old-tool.exe       # plain system Wine
+#   continuity-run --direct old-tool.exe       # direct host Proton (no UMU)
+#   continuity-run --print-env game.exe        # show resolved env, launch nothing
+set -euo pipefail
+
+# --- locate the shared library ------------------------------------------------
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+if [ -z "$_lib" ] || [ ! -r "$_lib" ]; then
+  echo "continuity-run: cannot locate continuity-common.sh (set CONTINUITY_LIB)" >&2
+  exit 1
+fi
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+PROG="${0##*/}"
+
+usage() {
+  cat <<'EOF'
+continuity-run — Universal Windows Compatibility Engine (ContinuityOS)
+
+USAGE
+  continuity-run [options] <file.exe|file.lnk|file.msi> [-- <args for the app>]
+
+PREFIX OPTIONS
+  -n, --name NAME      Prefix + launcher name (default: derived from the file name)
+  -p, --prefix NAME    Alias for --name
+  -r, --reset          Delete the target prefix before launching
+      --new-prefix     Abort instead of reusing an existing prefix
+
+ENGINE OPTIONS
+  -N, --native         Use system Wine instead of Proton
+      --umu            Use UMU + Proton (default; launches outside Steam)
+      --direct         Use a host Proton script directly, without UMU
+      --proton PATH    Alias for --direct --proton PATH (legacy)
+  -g, --game GAMEID    Stable Proton/game ID passed to the launcher (default: 0)
+  -P, --proton PATH    Select a Proton build (implies --direct; optional path)
+  -e, --env KEY=VAL    Extra environment variable (repeatable)
+  -d, --dir DIR        Working directory for the application
+
+LAUNCHER OPTIONS
+  -i, --installer      Treat the input as an installer; after it exits successfully,
+                       scan the prefix and register launchers for new executables
+  -a, --add-launcher   Always scan the prefix and register launchers afterwards
+
+OTHER
+  -T, --terminal       Run attached to a terminal (for console installers)
+  -q, --quiet          Less output
+      --print-env      Print the resolved environment as KEY=VALUE and exit
+  -h, --help           This help
+  -V, --version        Version
+
+ENVIRONMENT CONFIG
+  ~/.config/continuity/environment.conf is sourced first. Supported keys:
+    CONTINUITY_GAMEID            default Steam-compatible app ID
+    CONTINUITY_PROTONPATH        Proton install directory/name (default: host Steam Proton)
+    CONTINUITY_DEFAULT_ENGINE    umu | direct | wine (default: umu)
+    CONTINUITY_STEAM_ROOT        Steam installation root (auto-detected if unset)
+    CONTINUITY_AUTO_LAUNCHERS    0 | 1
+    CONTINUITY_GAMESCOPE         0 | 1  (wrap with gamescope when available)
+    CONTINUITY_MANGOHUD          0 | 1
+
+EXAMPLES
+  continuity-run ~/Downloads/GameSetup.exe
+  continuity-run --direct --proton "Proton - Experimental" ~/Games/hk.exe
+  continuity-run --direct --name legacy-app ~/Games/tool.exe
+  continuity-run --native --name legacy-app /mnt/stick/tool.exe
+  continuity-run --print-env ~/Downloads/anything.exe
+EOF
+}
+
+# --- defaults -----------------------------------------------------------------
+SLUG=""
+GAMEID_OVERRIDE=""
+PROTON_OVERRIDE=""
+ENGINE_OVERRIDE=""
+UMU_OVERRIDE=0
+WORKDIR=""
+QUIET=0
+PRINT_ENV=0
+RESET=0
+NEW_PREFIX=0
+IS_INSTALLER=0
+ADD_LAUNCHER=0
+TERMINAL=0
+POSITIONAL=()
+APP_ARGS=()
+declare -a EXTRA_ENV=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -n|--name|--prefix|-p) [ $# -ge 2 ] || continuity_die "$1 needs an argument"; SLUG="$2"; shift 2 ;;
+    -r|--reset)            RESET=1; shift ;;
+    --new-prefix)          NEW_PREFIX=1; shift ;;
+    -N|--native)           ENGINE_OVERRIDE="wine"; shift ;;
+    --umu)                 ENGINE_OVERRIDE="umu"; shift ;;
+    --direct)              ENGINE_OVERRIDE="direct"; shift ;;
+    -g|--game)             [ $# -ge 2 ] || continuity_die "$1 needs an argument"; GAMEID_OVERRIDE="$2"; shift 2 ;;
+    -P|--proton)           [ $# -ge 2 ] || continuity_die "$1 needs an argument"; PROTON_OVERRIDE="$2"; ENGINE_OVERRIDE="direct"; shift 2 ;;
+    -e|--env)              [ $# -ge 2 ] || continuity_die "$1 needs an argument"; EXTRA_ENV+=("$2"); shift 2 ;;
+    -d|--dir)              [ $# -ge 2 ] || continuity_die "$1 needs an argument"; WORKDIR="$2"; shift 2 ;;
+    -i|--installer)        IS_INSTALLER=1; shift ;;
+    -a|--add-launcher)     ADD_LAUNCHER=1; shift ;;
+    -T|--terminal)         TERMINAL=1; shift ;;
+    -q|--quiet)            QUIET=1; shift ;;
+    --print-env)           PRINT_ENV=1; shift ;;
+    -h|--help)             usage; exit 0 ;;
+    -V|--version)          printf '%s %s\n' "$PROG" "$CONTINUITY_VERSION"; exit 0 ;;
+    --)                    shift; APP_ARGS=("$@"); break ;;
+    -*)                    continuity_die "unknown option '$1' (see --help)" ;;
+    *)                     POSITIONAL+=("$1"); shift ;;
+  esac
+done
+
+[ "${#POSITIONAL[@]}" -ge 1 ] || { usage >&2; exit 2; }
+
+TARGET="${POSITIONAL[0]}"
+if [ "${#POSITIONAL[@]}" -gt 1 ]; then
+  APP_ARGS=("${POSITIONAL[@]:1}")
+fi
+
+continuity_load_env
+continuity_ensure_dirs
+
+[ -e "$TARGET" ] || continuity_die "file not found: $TARGET"
+TARGET_ABS="$(readlink -f -- "$TARGET")"
+TARGET_BASE="${TARGET_ABS##*/}"
+TARGET_EXT="$(printf '%s' "${TARGET_BASE##*.}" | tr '[:upper:]' '[:lower:]')"
+
+case "$TARGET_EXT" in
+  exe|msi|bat|cmd|lnk) ;;
+  *) continuity_warn "'$TARGET_BASE' is not a Windows executable (.exe/.msi/.bat/.cmd/.lnk) — continuing anyway" ;;
+esac
+
+# --- resolve slug -------------------------------------------------------------
+if [ -z "$SLUG" ]; then
+  if [ -n "${CONTINUITY_APP_NAME:-}" ]; then
+    SLUG="$CONTINUITY_APP_NAME"
+  else
+    SLUG="$(continuity_slug_for_file "$TARGET_ABS")"
+  fi
+fi
+SLUG="$(continuity_slugify "$SLUG")"
+PREFIX_DIR="$(continuity_prefix_dir "$SLUG")"
+
+# --- engine selection ---------------------------------------------------------
+ENGINE="${ENGINE_OVERRIDE:-${CONTINUITY_DEFAULT_ENGINE:-umu}}"
+case "$ENGINE" in
+  umu|direct|wine) ;;
+  proton) ENGINE="direct" ;; # compatibility alias for older configs
+  *) continuity_die "unsupported engine '$ENGINE' (choose umu, direct, or wine)" ;;
+esac
+
+# Wine knows the Windows shell integration needed by shortcuts and MSIs.
+case "$TARGET_EXT" in
+  lnk|msi) [ "$ENGINE" = "wine" ] || continuity_debug "$TARGET_EXT -> forcing native Wine path"; ENGINE="wine" ;;
+esac
+
+# --- reset / collision handling ----------------------------------------------
+if [ -e "$PREFIX_DIR" ] && [ "$RESET" = "1" ]; then
+  if continuity_confirm "Delete the whole prefix '$SLUG' ($PREFIX_DIR)?"; then
+    rm -rf -- "$PREFIX_DIR"
+    continuity_info "removed prefix '$SLUG'"
+  else
+    continuity_die "aborted"
+  fi
+fi
+
+if [ -e "$PREFIX_DIR" ] && [ "$NEW_PREFIX" = "1" ]; then
+  continuity_die "prefix '$SLUG' already exists at $PREFIX_DIR (drop --new-prefix to reuse it)"
+fi
+
+FRESH_PREFIX=0
+[ -e "$PREFIX_DIR/pfx/drive_c" ] || [ -e "$PREFIX_DIR/drive_c" ] || FRESH_PREFIX=1
+mkdir -p "$PREFIX_DIR"
+chmod 700 "$PREFIX_DIR" 2>/dev/null || true
+
+# --- runtime and prefix selection --------------------------------------------
+GAMEID="${GAMEID_OVERRIDE:-${CONTINUITY_GAMEID:-0}}"
+PROTON_SELECTOR="${PROTON_OVERRIDE:-${CONTINUITY_PROTONPATH:-}}"
+STEAM_ROOT="$(continuity_steam_root)"
+PROTON_DIR=""
+PROTON_SCRIPT=""
+COMPAT_DATA_PATH="$PREFIX_DIR"
+WINEPREFIX="$PREFIX_DIR"
+
+if [ "$ENGINE" = "direct" ]; then
+  if [ -n "$PROTON_SELECTOR" ]; then
+    PROTON_DIR="$(continuity_resolve_proton "$PROTON_SELECTOR" 2>/dev/null || true)"
+  else
+    PROTON_DIR="$(continuity_find_host_proton 2>/dev/null || true)"
+  fi
+  if [ -n "$PROTON_DIR" ]; then
+    PROTON_SCRIPT="$PROTON_DIR/proton"
+    WINEPREFIX="$PREFIX_DIR/pfx"
+    if  [ ! -e "$PREFIX_DIR/pfx/drive_c" ] \
+       && [ -d "$PREFIX_DIR/drive_c" ] \
+       && { [ -f "$PREFIX_DIR/system.reg" ] || [ -d "$PREFIX_DIR/dosdevices" ]; }; then
+
+      if [ "$PRINT_ENV" != "1" ]; then
+        mkdir -p "$PREFIX_DIR/pfx"
+        shopt -s dotglob nullglob
+        for old_entry in "$PREFIX_DIR"/*; do
+          [ "${old_entry##*/}" = "pfx" ] && continue
+          mv -- "$old_entry" "$PREFIX_DIR/pfx/"
+        done
+        shopt -u dotglob nullglob
+        continuity_info "migrated legacy prefix '$SLUG' to direct Proton's compatdata/pfx layout"
+      fi
+    fi
+    if [ -d "$PREFIX_DIR/pfx/drive_c" ] || [ -e "$PREFIX_DIR/pfx/system.reg" ]; then
+      WINEPREFIX="$PREFIX_DIR/pfx"
+    fi
+  fi
+fi
+
+export WINEPREFIX STEAM_COMPAT_DATA_PATH="$COMPAT_DATA_PATH"
+export STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT"
+export STEAM_COMPAT_APP_ID="$GAMEID" SteamAppId="$GAMEID" SteamGameId="$GAMEID"
+export GAMEID
+if [ -n "$PROTON_DIR" ]; then PROTONPATH="$PROTON_DIR"; fi
+[ -n "${PROTONPATH:-}" ] || unset PROTONPATH
+export PROTON_VERB="${PROTON_VERB:-waitforexitandrun}"
+
+# MangoHud / gamescope are opt-in so a plain double-click stays lean.
+if [ "${CONTINUITY_MANGOHUD:-0}" = "1" ]; then export MANGOHUD=1; fi
+if [ "${CONTINUITY_GAMESCOPE:-0}" = "1" ]; then export CONTINUITY_USE_GAMESCOPE=1; fi
+
+for kv in ${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}; do
+  case "$kv" in
+    *=*) export "$kv" ;;
+    *)   continuity_die "--env expects KEY=VALUE (got '$kv')" ;;
+  esac
+done
+
+# --- command construction -----------------------------------------------------
+declare -a CMD=()
+if [ "$ENGINE" = "umu" ]; then
+  CMD=(umu-run "$TARGET_ABS")
+  if [ "${#APP_ARGS[@]}" -gt 0 ] && [ -n "${APP_ARGS[0]:-}" ]; then CMD+=("${APP_ARGS[@]}"); fi
+elif [ "$ENGINE" = "direct" ] && [ -n "$PROTON_SCRIPT" ]; then
+  CMD=("$PROTON_SCRIPT" "${PROTON_VERB}" "$TARGET_ABS")
+  if [ "${#APP_ARGS[@]}" -gt 0 ] && [ -n "${APP_ARGS[0]:-}" ]; then CMD+=("${APP_ARGS[@]}"); fi
+else
+  # Wine is *named* here but only required to exist at launch time, so that
+  # --print-env still works on a machine where Wine is not installed yet.
+  if [ "$TARGET_EXT" = "msi" ]; then
+    CMD=(wine msiexec /i "$TARGET_ABS")
+  elif [ "$TARGET_EXT" = "lnk" ]; then
+    CMD=(wine start /unix "$TARGET_ABS")
+  else
+    CMD=(wine "$TARGET_ABS")
+  fi
+fi
+
+# gamescope wrapper (only when explicitly requested and actually installed)
+if [ "${CONTINUITY_USE_GAMESCOPE:-0}" = "1" ] && continuity_have gamescope; then
+  CMD=(gamescope --adaptive-sync --fullscreen -- "${CMD[@]}")
+fi
+if [ "$ENGINE" = "wine" ] && [ "${#APP_ARGS[@]}" -gt 0 ] && [ -n "${APP_ARGS[0]:-}" ]; then
+  CMD+=("${APP_ARGS[@]}")
+fi
+
+# Proton and Wine commands already include the target path.
+# --- print-env (verification path; launches nothing) --------------------------
+if [ "$PRINT_ENV" = "1" ]; then
+  printf 'CONTINUITY_SLUG=%s\n' "$SLUG"
+  printf 'CONTINUITY_PREFIX_DIR=%s\n' "$PREFIX_DIR"
+  if [ "$ENGINE" = "umu" ]; then
+    printf 'CONTINUITY_DRIVE_C=%s/drive_c\n' "$PREFIX_DIR"
+  elif [ "$ENGINE" = "direct" ] && [ -d "$PREFIX_DIR/drive_c" ] && [ ! -d "$PREFIX_DIR/pfx/drive_c" ]; then
+    printf 'CONTINUITY_DRIVE_C=%s/drive_c\n' "$PREFIX_DIR"
+  else
+    printf 'CONTINUITY_DRIVE_C=%s/drive_c\n' "$WINEPREFIX"
+  fi
+  printf 'CONTINUITY_ENGINE=%s\n' "$ENGINE"
+  printf 'CONTINUITY_LAUNCH_MODE=%s\n' "$ENGINE"
+  printf 'CONTINUITY_PREFIX_ROOT=%s\n' "$PREFIX_DIR"
+  printf 'CONTINUITY_FRESH_PREFIX=%s\n' "$FRESH_PREFIX"
+  printf 'WINEPREFIX=%s\n' "$WINEPREFIX"
+  printf 'GAMEID=%s\n' "$GAMEID"
+  printf 'PROTONPATH=%s\n' "${PROTON_DIR:-${PROTON_SELECTOR:-${ENGINE}}}"
+  printf 'PROTON_SCRIPT=%s\n' "${PROTON_SCRIPT:-missing}"
+  printf 'PROTON_VERB=%s\n' "$PROTON_VERB"
+  printf 'STEAM_COMPAT_DATA_PATH=%s\n' "$STEAM_COMPAT_DATA_PATH"
+  printf 'STEAM_COMPAT_CLIENT_INSTALL_PATH=%s\n' "$STEAM_COMPAT_CLIENT_INSTALL_PATH"
+  printf 'STEAM_COMPAT_APP_ID=%s\n' "$STEAM_COMPAT_APP_ID"
+  printf 'SteamAppId=%s\n' "$SteamAppId"
+  printf 'SteamGameId=%s\n' "$SteamGameId"
+  if [ "$ENGINE" = "umu" ] && ! continuity_have umu-run; then
+    printf 'COMMAND=<unavailable: umu-run not found>\n'
+  elif [ "$ENGINE" = "direct" ] && [ -z "$PROTON_SCRIPT" ]; then
+    printf 'COMMAND=<unavailable: Proton not found>\n'
+  else
+    printf 'COMMAND=%s\n' "${CMD[*]}"
+  fi
+  exit 0
+fi
+
+# --- engine availability ------------------------------------------------------
+if [ "$ENGINE" = "umu" ] && ! continuity_have umu-run; then
+  continuity_die "umu-run not found — $(continuity_umu_hint)"
+fi
+if [ "$ENGINE" = "direct" ] && [ -z "$PROTON_SCRIPT" ]; then
+  if [ -n "$PROTON_SELECTOR" ]; then
+    continuity_die "Proton '$PROTON_SELECTOR' was not found or has no executable proton script — install a Steam Proton build or pass --proton /path/to/Proton"
+  fi
+  continuity_die "no host Proton build found — install/launch Steam and select a Valve Proton version, or use --umu"
+fi
+if [ "$ENGINE" = "wine" ] && ! continuity_have wine; then
+  continuity_die "wine not found — $(continuity_pkg_command wine wine32 2>/dev/null || printf 'install wine from your distribution')"
+fi
+
+# --- first-run setup ----------------------------------------------------------
+if [ "$FRESH_PREFIX" = "1" ]; then
+  continuity_info "first launch: creating isolated prefix '$SLUG'"
+  continuity_info "  drive_c -> $(continuity_prefix_drive_c "$SLUG")"
+  # Proton initializes its pfx on the first real invocation. Wine can initialize
+  # an isolated prefix independently for the explicit --native path.
+  if [ "$ENGINE" = "wine" ] && continuity_have wineboot; then
+    WINEPREFIX="$PREFIX_DIR" wineboot -u >/dev/null 2>&1 || true
+  fi
+fi
+
+# --- launch -------------------------------------------------------------------
+continuity_log "launch slug=$SLUG engine=$ENGINE exe=$TARGET_ABS args=${APP_ARGS[*]:-}"
+[ "$QUIET" = "1" ] || continuity_info "launching '$SLUG' via $ENGINE"
+
+if [ -n "$WORKDIR" ]; then cd -- "$WORKDIR"; fi
+
+run_command() {
+  if [ "$TERMINAL" = "1" ] && [ -t 0 ]; then
+    "${CMD[@]}"
+  else
+    "${CMD[@]}"
+  fi
+}
+set +e
+run_command
+rc=$?
+set -e
+
+[ "$rc" -eq 0 ] || continuity_warn "'$TARGET_BASE' exited with status $rc"
+
+# --- post-install launcher discovery -----------------------------------------
+if [ "$rc" -eq 0 ] && { [ "$IS_INSTALLER" = "1" ] || [ "$ADD_LAUNCHER" = "1" ] || [ "${CONTINUITY_AUTO_LAUNCHERS:-0}" = "1" ]; }; then
+  if continuity_have continuity-prefix; then
+    continuity-prefix launchers "$SLUG" --auto || \
+      continuity_warn "could not register launchers for '$SLUG'"
+  fi
+fi
+
+exit "$rc"

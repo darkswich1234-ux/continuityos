@@ -1,0 +1,552 @@
+;;; ContinuityOS — Eww shell: dock, Android-style quick-settings drawer, notification centre.
+;;; Config lives at ~/.config/eww/ and is started by continuity-session-start
+;;; (eww daemon && eww open dock).
+;;;
+;;; Window names are part of the CLI contract and must not change:
+;;;   dock          bottom overlay launcher
+;;;   drawer        quick-settings shade (Wi-Fi / BT / audio / brightness / performance)
+;;;   notifications notification centre
+;;; Each window is a GTK layer-shell surface; eww publishes the window name as the
+;;; layer-shell namespace, which is what Hyprland layer rules match on
+;;; (blur on, match:namespace drawer etc.).
+;;;
+;;; Widget commands run through `sh -c`, so $HOME expands.
+;;; Fonts: like the Waybar config, this shell expects a Nerd Font for the small
+;;; slider icons below. Dock items and buttons are plain text, and ✕ exists in
+;;; DejaVu Sans, so the layout survives without one — only the three slider
+;;; icons would render as placeholder boxes. Helper scripts emit Nerd Font glyphs
+;;; by default and plain text when CONTINUITY_GLYPH_MODE=text is exported.
+
+(defpoll clock-time  :interval "20s"  "$HOME/.config/eww/scripts/system-info.sh time")
+(defpoll clock-date  :interval "300s" "$HOME/.config/eww/scripts/system-info.sh date")
+
+(defpoll cpu            :interval "4s"  "$HOME/.config/eww/scripts/system-info.sh cpu")
+(defpoll ram            :interval "4s"  "$HOME/.config/eww/scripts/system-info.sh ram")
+(defpoll ram-used       :interval "8s"  "$HOME/.config/eww/scripts/system-info.sh mem-used")
+(defpoll gpu            :interval "5s"  "$HOME/.config/eww/scripts/system-info.sh gpu")
+(defpoll battery        :interval "60s" "$HOME/.config/eww/scripts/system-info.sh battery")
+(defpoll battery-icon   :interval "60s" "$HOME/.config/eww/scripts/system-info.sh battery-icon")
+(defpoll battery-status :interval "60s" "$HOME/.config/eww/scripts/system-info.sh battery-status")
+(defpoll uptime         :interval "60s" "$HOME/.config/eww/scripts/system-info.sh uptime")
+
+(defpoll wifi-status :interval "5s"  "$HOME/.config/eww/scripts/wifi.sh status")
+(defpoll wifi-state  :interval "5s"  "$HOME/.config/eww/scripts/wifi.sh state")
+(defpoll wifi-icon   :interval "5s"  "$HOME/.config/eww/scripts/wifi.sh icon")
+(defpoll wifi-signal :interval "10s" "$HOME/.config/eww/scripts/wifi.sh signal")
+
+(defpoll bt-status :interval "5s" "$HOME/.config/eww/scripts/bluetooth.sh status")
+(defpoll bt-state  :interval "5s" "$HOME/.config/eww/scripts/bluetooth.sh state")
+(defpoll bt-icon   :interval "5s" "$HOME/.config/eww/scripts/bluetooth.sh icon")
+
+(defpoll volume :interval "2s" "$HOME/.config/eww/scripts/audio.sh sink-get")
+(defpoll muted  :interval "2s" "$HOME/.config/eww/scripts/audio.sh sink-mute")
+(defpoll mic    :interval "3s" "$HOME/.config/eww/scripts/audio.sh source-get")
+
+(defpoll brightness :interval "3s" "$HOME/.config/eww/scripts/brightness.sh get")
+
+(defpoll notif-summary :interval "5s"  "$HOME/.config/eww/scripts/notifications.sh summary")
+(defpoll notif-count   :interval "5s"  "$HOME/.config/eww/scripts/notifications.sh count")
+(defpoll notif-paused  :interval "5s"  "$HOME/.config/eww/scripts/notifications.sh paused")
+(defpoll notif-list    :interval "10s" "$HOME/.config/eww/scripts/notifications.sh list")
+
+(defpoll gaming-state  :interval "5s"  "$HOME/.config/eww/scripts/gaming.sh state")
+(defpoll power-profile :interval "30s" "powerprofilesctl get 2>/dev/null || echo balanced")
+
+;; ---------------------------------------------------------------------------
+;; Reusable pieces
+;; ---------------------------------------------------------------------------
+
+;; A Material You tile: big rounded surface, label pair, tap to act.
+(defwidget tile [title subtitle icon onclick class]
+  (button :class "tile ${class}" :onclick onclick
+    (box :orientation "h" :space-evenly false :valign "center" :class "tile-inner"
+      (label :class "tile-icon" :text icon)
+      (box :orientation "v" :space-evenly false :class "tile-text"
+        (label :class "tile-title" :text title)
+        (label :class "tile-subtitle" :text subtitle :truncate true :limit-width 24)))))
+
+;; Horizontal slider row with a live value readout.
+(defwidget slider-row [icon value suffix onchange onclick-icon class]
+  (box :orientation "h" :class "slider-row ${class}" :space-evenly false :valign "center"
+    (button :class "slider-icon-btn" :onclick onclick-icon
+      (label :class "slider-icon" :text icon))
+    (scale :class "slider"
+           :value value
+           :min 0
+           :max 100
+           :onchange onchange)
+    (label :class "slider-value" :text "${value}${suffix}")))
+
+;; A dock entry.
+(defwidget dockitem [label cmd class]
+  (button :class "dock-item ${class}" :onclick cmd
+    (label :class "dock-label" :text label)))
+
+;; ---------------------------------------------------------------------------
+;; Bottom dock
+;; ---------------------------------------------------------------------------
+(defwindow dock
+  :monitor 0
+  :windowtype "dock"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "100%"
+                      :height "64px"
+                      :anchor "bottom center")
+  (box :class "dock" :orientation "h" :space-evenly false :halign "center" :valign "end"
+    (box :class "dock-inner" :orientation "h" :space-evenly false
+      (dockitem :label "Apps" :class "dock-item-apps"
+        :cmd "rofi -show drun -theme $HOME/.config/rofi/continuity.rasi")
+      (dockitem :label "Files" :class "dock-item-files"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'nautilus|dolphin|thunar|nemo|pcmanfm'")
+      (dockitem :label "Terminal"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'kitty|alacritty|foot|wezterm|gnome-terminal|konsole'")
+      (dockitem :label "Browser"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'firefox|chromium|brave|vivaldi|epiphany'")
+      (dockitem :label "Steam"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'desktop:steam.desktop|steam'")
+      (dockitem :label "Freebuff" :class "dock-item-freebuff"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'freebuff-desktop|freebuff|desktop:freebuff.desktop'")
+      (dockitem :label "PhotoCraft"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'photocraft|gimp|krita'")
+      (dockitem :label "FilmCraft"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'filmcraft|kdenlive'")
+      (dockitem :label "Windows" :class "dock-item-windows"
+        :cmd "$HOME/.config/eww/scripts/launch.sh 'continuity-prefix'")
+      (dockitem :label "Panel" :class "dock-item-panel"
+        :cmd "/usr/local/bin/continuity-panel toggle drawer"))))
+
+;; ---------------------------------------------------------------------------
+;; Quick-settings drawer (Android notification shade)
+;; ---------------------------------------------------------------------------
+(defwindow drawer
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "440px"
+                      :height "700px"
+                      :anchor "top center")
+  (box :class "drawer" :orientation "v" :space-evenly false
+
+    ;; --- header: clock, date, battery, close -------------------------------
+    (box :class "drawer-head" :orientation "h" :space-evenly false :valign "center"
+      (box :orientation "v" :space-evenly false :class "drawer-head-time"
+        (label :class "head-clock" :text "${clock-time}")
+        (label :class "head-date" :text "${clock-date}"))
+      (box :orientation "v" :space-evenly false :halign "end" :class "drawer-head-status"
+        (label :class "head-battery" :text "${battery-icon} ${battery}% · ${battery-status}")
+        (label :class "head-cpu" :text "CPU ${cpu} · RAM ${ram}"))
+      (button :class "head-close" :onclick "/usr/local/bin/continuity-panel close"
+        (label :text "✕")))
+
+    ;; --- connectivity tiles -----------------------------------------------
+    (box :class "tiles" :orientation "h" :space-evenly false
+      (tile :title "Wi-Fi"
+            :subtitle "${wifi-status}"
+            :icon "${wifi-icon}"
+            :class "tile-wifi tile-${wifi-state}"
+            :onclick "$HOME/.config/eww/scripts/wifi.sh toggle")
+      (tile :title "Bluetooth"
+            :subtitle "${bt-status}"
+            :icon "${bt-icon}"
+            :class "tile-bt tile-${bt-state}"
+            :onclick "$HOME/.config/eww/scripts/bluetooth.sh toggle"))
+
+    ;; --- sound --------------------------------------------------------------
+    (box :orientation "v" :class "card" :space-evenly false
+      (box :orientation "h" :class "card-head" :space-evenly false
+        (label :class "card-title" :text "Sound")
+        (label :class "card-subtitle" :text "${volume}% · ${power-profile}"))
+      (slider-row :icon ""
+                  :value volume
+                  :suffix "%"
+                  :class "slider-volume slider-muted-${muted}"
+                  :onchange "$HOME/.config/eww/scripts/audio.sh sink-set {}"
+                  :onclick-icon "$HOME/.config/eww/scripts/audio.sh sink-mute-toggle")
+      (slider-row :icon ""
+                  :value mic
+                  :suffix "%"
+                  :class "slider-mic"
+                  :onchange "$HOME/.config/eww/scripts/audio.sh source-set {}"
+                  :onclick-icon "$HOME/.config/eww/scripts/audio.sh source-mute-toggle"))
+
+    ;; --- display ------------------------------------------------------------
+    (box :orientation "v" :class "card" :space-evenly false
+      (box :orientation "h" :class "card-head" :space-evenly false
+        (label :class "card-title" :text "Display")
+        (label :class "card-subtitle" :text "${brightness}%"))
+      (slider-row :icon ""
+                  :value brightness
+                  :suffix "%"
+                  :class "slider-brightness"
+                  :onchange "$HOME/.config/eww/scripts/brightness.sh set {}"
+                  :onclick-icon "$HOME/.config/eww/scripts/brightness.sh nightlight"))
+
+    ;; --- performance (gaming mode) -----------------------------------------
+    (box :orientation "v" :class "card card-performance" :space-evenly false
+      (box :orientation "h" :class "card-head" :space-evenly false
+        (label :class "card-title" :text "Performance")
+        (label :class "card-subtitle" :text "CPU ${cpu} · GPU ${gpu}"))
+      (box :orientation "h" :class "segments" :space-evenly false
+        (button :class "seg seg-balanced-${gaming-state}"
+                :onclick "/usr/local/bin/continuity-gaming-mode off"
+          (label :class "seg-label" :text "Balanced"))
+        (button :class "seg seg-gaming-${gaming-state}"
+                :onclick "/usr/local/bin/continuity-gaming-mode on"
+          (label :class "seg-label" :text "Gaming")))
+      ;; GTK labels cannot paint backgrounds, so every chip is a box + label.
+      (box :orientation "h" :class "chips" :space-evenly false
+        (box :class "chip" :orientation "h" :space-evenly false
+          (label :class "chip-label" :text "CPU ${cpu}%"))
+        (box :class "chip" :orientation "h" :space-evenly false
+          (label :class "chip-label" :text "GPU ${gpu}"))
+        (box :class "chip" :orientation "h" :space-evenly false
+          (label :class "chip-label" :text "RAM ${ram-used}"))
+        (box :class "chip" :orientation "h" :space-evenly false
+          (label :class "chip-label" :text "Wi-Fi ${wifi-signal}%"))
+        (box :class "chip" :orientation "h" :space-evenly false
+          (label :class "chip-label" :text "Up ${uptime}"))))
+
+    ;; --- notifications summary ---------------------------------------------
+    (box :orientation "h" :class "card card-notifications" :space-evenly false :valign "center"
+      (label :class "card-title" :text "${notif-summary}")
+      (box :orientation "h" :space-evenly false :halign "end"
+        (button :class "mini-btn mini-btn-dnd-${notif-paused}"
+                :onclick "$HOME/.config/eww/scripts/notifications.sh toggle-dnd"
+          (label :text "DND"))
+        (button :class "mini-btn" :onclick "/usr/local/bin/continuity-panel toggle notifications"
+          (label :text "Open"))
+        (button :class "mini-btn" :onclick "$HOME/.config/eww/scripts/notifications.sh clear"
+          (label :text "Clear"))))
+
+    ;; --- power --------------------------------------------------------------
+    (box :class "card card-power" :orientation "v" :space-evenly false
+      (label :class "card-title" :text "Power")
+      (box :orientation "h" :class "power-row" :space-evenly false
+        (button :class "power-btn" :onclick "/usr/local/bin/continuity-panel power lock"
+          (label :text "Lock"))
+        (button :class "power-btn" :onclick "/usr/local/bin/continuity-panel power suspend"
+          (label :text "Sleep"))
+        (button :class "power-btn" :onclick "/usr/local/bin/continuity-panel power reboot"
+          (label :text "Reboot"))
+        (button :class "power-btn power-btn-danger" :onclick "/usr/local/bin/continuity-panel power shutdown"
+          (label :text "Off"))))))
+
+;; ---------------------------------------------------------------------------
+;; Notification centre — rendered from dunst's history as Pango markup
+;; ---------------------------------------------------------------------------
+(defwindow notifications
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "440px"
+                      :height "640px"
+                      :anchor "top right")
+  (box :class "notif" :orientation "v" :space-evenly false
+    (box :class "notif-head" :orientation "h" :space-evenly false :valign "center"
+      (label :class "notif-title" :text "Notifications")
+      (box :orientation "h" :space-evenly false :halign "end"
+        (button :class "mini-btn mini-btn-dnd-${notif-paused}"
+                :onclick "$HOME/.config/eww/scripts/notifications.sh toggle-dnd"
+          (label :text "DND"))
+        (button :class "mini-btn" :onclick "$HOME/.config/eww/scripts/notifications.sh clear"
+          (label :text "Clear all"))
+        (button :class "head-close" :onclick "/usr/local/bin/continuity-panel close"
+          (label :text "✕"))))
+    (label :class "notif-subtitle" :text "${notif-summary} · ${notif-count} in history")
+    (scroll :class "notif-scroll" :vscroll true :hscroll false :height 500
+      (box :orientation "v" :class "notif-list" :space-evenly false
+        (box :class "notif-body" :orientation "v" :space-evenly false
+          (label :class "notif-body-label"
+                 :markup "pango"
+                 :wrap true
+                 :text "${notif-list}"))))))
+
+;; ===========================================================================
+;; First-run wizard
+;; ===========================================================================
+;; One window per step instead of one window with conditional content. Eww's
+;; `:visible` is a relatively recent addition, and a construct this shell cannot
+;; parse would take the dock and the drawer down with it — so each step gets its
+;; own surface. Only one is ever open, and the engine (bin/continuity-wizard,
+;; show_page) opens them by name, so these window names are contract.
+;;
+;; The buttons are ordinary shell commands (Eww runs :onclick through sh -c),
+;; which is why they can chain a step with `&&`.
+;; ===========================================================================
+
+(defpoll wizard-greeting    :interval "60s" "$HOME/.config/eww/scripts/wizard.sh greeting")
+(defpoll wizard-page        :interval "2s"  "$HOME/.config/eww/scripts/wizard.sh page")
+(defpoll wizard-steam-info  :interval "5s"  "$HOME/.config/eww/scripts/wizard.sh steam-info")
+(defpoll wizard-steam-games :interval "5s"  "$HOME/.config/eww/scripts/wizard.sh steam-games")
+(defpoll wizard-app-name    :interval "2s"  "$HOME/.config/eww/scripts/wizard.sh app-name")
+(defpoll wizard-app-state   :interval "2s"  "$HOME/.config/eww/scripts/wizard.sh app-state")
+(defpoll wizard-mode        :interval "2s"  "$HOME/.config/eww/scripts/wizard.sh mode")
+(defpoll wizard-error       :interval "5s"  "$HOME/.config/eww/scripts/wizard.sh error")
+(defpoll wizard-prefix-root :interval "60s" "$HOME/.config/eww/scripts/wizard.sh prefix-root")
+;; Steps 1, 3 and 5 read stored state only: the wizard refreshes it when a page
+;; opens, so a poll never shells out to a hardware check every couple of seconds.
+(defpoll wizard-region-summary  :interval "10s" "$HOME/.config/eww/scripts/wizard.sh region-summary")
+(defpoll wizard-region-locale   :interval "10s" "$HOME/.config/eww/scripts/wizard.sh region-locale")
+(defpoll wizard-region-keymap   :interval "10s" "$HOME/.config/eww/scripts/wizard.sh region-keymap")
+(defpoll wizard-region-timezone :interval "10s" "$HOME/.config/eww/scripts/wizard.sh region-timezone")
+(defpoll wizard-region-wifi     :interval "10s" "$HOME/.config/eww/scripts/wizard.sh region-wifi")
+(defpoll wizard-shakedown-state    :interval "5s" "$HOME/.config/eww/scripts/wizard.sh shakedown-state")
+(defpoll wizard-shakedown-summary  :interval "5s" "$HOME/.config/eww/scripts/wizard.sh shakedown-summary")
+(defpoll wizard-shakedown-headline :interval "5s" "$HOME/.config/eww/scripts/wizard.sh shakedown-headline")
+(defpoll wizard-shakedown-fix      :interval "5s" "$HOME/.config/eww/scripts/wizard.sh shakedown-fix")
+(defpoll wizard-transfer-state   :interval "5s" "$HOME/.config/eww/scripts/wizard.sh transfer-state")
+(defpoll wizard-transfer-summary :interval "5s" "$HOME/.config/eww/scripts/wizard.sh transfer-summary")
+
+;; Step heading: eyebrow, title, one-line explanation.
+(defwidget wiz-head [step title subtitle]
+  (box :class "wiz-head" :orientation "v" :space-evenly false
+    (label :class "wiz-step" :text step)
+    (label :class "wiz-title" :text title)
+    (label :class "wiz-subtitle" :text subtitle :wrap true :limit-width 72)))
+
+;; Body copy.
+(defwidget wiz-note [text]
+  (label :class "wiz-body" :text text :wrap true :limit-width 72))
+
+;; One key/value fact, e.g. where Windows apps will live.
+(defwidget wiz-fact [icon text]
+  (box :class "wiz-fact" :orientation "h" :space-evenly false :valign "center"
+    (label :class "wiz-fact-icon" :text icon)
+    (label :class "wiz-fact-text" :text text :wrap true :limit-width 64)))
+
+;; Large tappable action.
+(defwidget wiz-btn [label cmd kind]
+  (button :class "wiz-btn wiz-btn-${kind}" :onclick cmd
+    (label :class "wiz-btn-label" :text label)))
+
+;; Only rendered meaningfully when the engine has something to report.
+(defwidget wiz-error [text]
+  (label :class "wiz-error" :text text :wrap true :limit-width 72))
+
+;; A status pill. The state is a closed vocabulary (pass|warn|fail|unknown) that
+;; the widget script guarantees, because it ends up in a CSS class name.
+(defwidget wiz-chip [text state]
+  (box :class "wiz-chip wiz-chip-${state}" :orientation "h" :space-evenly false :valign "center"
+    (label :class "wiz-chip-text" :text text)))
+
+;; --- step 0: welcome -------------------------------------------------------
+(defwindow wizard
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "CONTINUITYOS"
+              :title "Welcome to ContinuityOS"
+              :subtitle "${wizard-greeting}")
+    (wiz-note :text "Seven short steps: the keyboard and language you actually use, your Steam games, anything you want to bring over from another machine, a first Windows program, a check that games will run, and how sessions should start. Every choice here can be changed later — nothing in this wizard is permanent.")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "•" :text "Windows programs live in their own folder: ${wizard-prefix-root}/<app>/drive_c — so removing one is a single folder delete.")
+      (wiz-fact :icon "•" :text "Super+W opens quick settings, Super+G toggles gaming mode, Super+Space opens the app drawer."))
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Skip setup" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard finish")
+      (wiz-btn :label "Get started" :kind "primary" :cmd "/usr/local/bin/continuity-wizard goto region"))))
+
+;; --- step 1: this machine, spelled your way --------------------------------
+(defwindow wizard-region
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 1 OF 7"
+              :title "This machine, spelled your way"
+              :subtitle "${wizard-region-summary}")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "•" :text "Language and region: ${wizard-region-locale}")
+      (wiz-fact :icon "•" :text "Keyboard layout: ${wizard-region-keymap}")
+      (wiz-fact :icon "•" :text "Time zone: ${wizard-region-timezone}")
+      (wiz-fact :icon "•" :text "Network: ${wizard-region-wifi}"))
+    (wiz-note :text "This comes first because a layout you cannot type with makes every later step miserable, and no network makes them impossible. Your choices apply to your sessions; making them machine-wide (so other accounts and a login screen see them too) is 'sudo continuity-region … --system'.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-choices" :orientation "h" :space-evenly false
+      (wiz-btn :label "Language…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard pick-locale")
+      (wiz-btn :label "Keyboard…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard pick-keymap")
+      (wiz-btn :label "Time zone…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard pick-timezone")
+      (wiz-btn :label "Join Wi-Fi…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard wifi-join"))
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Use what was detected" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard autodetect && /usr/local/bin/continuity-wizard goto region")
+      (wiz-btn :label "Continue" :kind "primary" :cmd "/usr/local/bin/continuity-wizard goto steam"))))
+
+;; --- step 2: Steam ---------------------------------------------------------
+(defwindow wizard-steam
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 2 OF 7"
+              :title "Bring your games over"
+              :subtitle "A Steam library that already exists on this disk or another drive can be registered without re-downloading a single byte.")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "" :text "${wizard-steam-info}")
+      (wiz-fact :icon "" :text "Games in the library: ${wizard-steam-games}"))
+    (wiz-note :text "Importing only edits Steam's library list. No game file is moved or deleted, a backup of the list is kept beside it, and the import is refused outright if the file would end up malformed. Quit Steam first — it rewrites that list when it exits.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Skip" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto transfer")
+      (wiz-btn :label "Rescan" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto steam")
+      (wiz-btn :label "Import first library" :kind "primary" :cmd "/usr/local/bin/continuity-wizard import-steam --first && /usr/local/bin/continuity-wizard goto steam"))))
+
+;; --- step 3: bring a setup over --------------------------------------------
+(defwindow wizard-transfer
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 3 OF 7"
+              :title "Coming from another machine?"
+              :subtitle "${wizard-transfer-summary}")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "•" :text "Save here: one archive holding every Windows app's prefix, its launchers and your setup choices.")
+      (wiz-fact :icon "•" :text "Bring over: an archive from another ContinuityOS machine, verified against its own checksums first."))
+    (wiz-note :text "Nothing is ever overwritten quietly: an import either merges (keeping what is already here) and reports what it skipped, or moves the old copy aside with a timestamp. Wine and Proton's runtime, Steam itself and your game files are not in the archive — those are installed, not moved.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-choices" :orientation "h" :space-evenly false
+      (wiz-btn :label "Save this setup…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard transfer-export && /usr/local/bin/continuity-wizard goto transfer")
+      (wiz-btn :label "Bring one over…" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard transfer-import && /usr/local/bin/continuity-wizard goto transfer"))
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Not now" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto windows")
+      (wiz-btn :label "Continue" :kind "primary" :cmd "/usr/local/bin/continuity-wizard goto windows"))))
+
+;; --- step 4: first Windows app --------------------------------------------
+(defwindow wizard-windows
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 4 OF 7"
+              :title "Install your first Windows program"
+              :subtitle "Any .exe, .msi or shortcut. It runs through Proton inside its own isolated prefix.")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "" :text "${wizard-app-state}")
+      (wiz-fact :icon "" :text "Prefix root: ${wizard-prefix-root}"))
+    (wiz-note :text "Installers are recognised automatically: after one finishes, ContinuityOS finds the programs it dropped into the prefix and puts them in your app drawer and dock. You can also skip this and just double-click any .exe later.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Skip" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto shakedown")
+      (wiz-btn :label "Open prefix folder" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard open-prefix")
+      (wiz-btn :label "Choose a program…" :kind "primary" :cmd "/usr/local/bin/continuity-wizard install-exe"))))
+
+;; --- step 5: will it actually run? ----------------------------------------
+(defwindow wizard-shakedown
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 5 OF 7"
+              :title "Will your games actually run?"
+              :subtitle "The honest answer, read off this machine: Vulkan, the 32-bit stack, Wine, Proton, the Steam Linux Runtime and the GPU driver.")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-chip :text "${wizard-shakedown-summary}" :state "${wizard-shakedown-state}")
+      (wiz-fact :icon "•" :text "${wizard-shakedown-headline}")
+      (wiz-fact :icon "•" :text "Next step: ${wizard-shakedown-fix}"))
+    (wiz-note :text "A warning is not a verdict — a runtime that has not downloaded yet and a missing gamescope are both normal on a fresh machine. A failure names the package that fixes it. Checking again is free; 'Test it for real' starts an actual Windows program in a throwaway prefix and deletes it afterwards.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-choices" :orientation "h" :space-evenly false
+      (wiz-btn :label "Check again" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard shakedown && /usr/local/bin/continuity-wizard goto shakedown")
+      (wiz-btn :label "Test it for real" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard shakedown --probe && /usr/local/bin/continuity-wizard goto shakedown"))
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Skip" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto mode")
+      (wiz-btn :label "Continue" :kind "primary" :cmd "/usr/local/bin/continuity-wizard goto mode"))))
+
+;; --- step 6: Balanced or Gaming -------------------------------------------
+(defwindow wizard-mode
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "STEP 6 OF 7"
+              :title "How should sessions start?"
+              :subtitle "You are currently set to: ${wizard-mode}")
+    (box :class "wiz-choices" :orientation "h" :space-evenly false
+      (wiz-btn :label "Balanced — animations, blur, the full shell" :kind "primary" :cmd "/usr/local/bin/continuity-wizard set-mode balanced && /usr/local/bin/continuity-wizard goto done"))
+    (box :class "wiz-choices" :orientation "h" :space-evenly false
+      (wiz-btn :label "Gaming — lean, animations and indexing off" :kind "primary" :cmd "/usr/local/bin/continuity-wizard set-mode gaming && /usr/local/bin/continuity-wizard goto done"))
+    (wiz-note :text "Gaming mode is a switch, not a commitment: Super+G toggles it in either direction at any moment, and the Performance tile in Quick Settings does the same thing with a tap.")
+    (wiz-error :text "${wizard-error}")
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Back" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard back")
+      (wiz-btn :label "Keep the default" :kind "ghost" :cmd "/usr/local/bin/continuity-wizard goto done"))))
+
+;; --- step 4: done ---------------------------------------------------------
+(defwindow wizard-done
+  :monitor 0
+  :windowtype "utility"
+  :stacking "overlay"
+  :focusable true
+  :geometry (geometry :x "0%"
+                      :y "0%"
+                      :width "860px"
+                      :height "520px"
+                      :anchor "center")
+  (box :class "wizard-card" :orientation "v" :space-evenly false
+    (wiz-head :step "ALL SET"
+              :title "You're ready"
+              :subtitle "Everything below can be reached again without this wizard.")
+    (box :class "wiz-facts" :orientation "v" :space-evenly false
+      (wiz-fact :icon "•" :text "Locale, keyboard, zone: ${wizard-region-summary}")
+      (wiz-fact :icon "•" :text "Session style: ${wizard-mode}")
+      (wiz-fact :icon "•" :text "Steam: ${wizard-steam-info}")
+      (wiz-fact :icon "•" :text "Windows program: ${wizard-app-state}")
+      (wiz-fact :icon "•" :text "Moved setup: ${wizard-transfer-summary}")
+      (wiz-chip :text "${wizard-shakedown-summary}" :state "${wizard-shakedown-state}")
+      (wiz-fact :icon "•" :text "Windows apps: ${wizard-prefix-root}"))
+    (wiz-note :text "Double-click any .exe to install it, run 'continuity-prefix' to manage or completely uninstall a Windows app, 'continuity-shakedown' when a game refuses to start, and 'continuity-boot off' if you would rather have a login prompt at boot.")
+    (box :class "wiz-actions" :orientation "h" :space-evenly false :halign "end"
+      (wiz-btn :label "Open quick settings" :kind "ghost" :cmd "/usr/local/bin/continuity-panel toggle drawer && /usr/local/bin/continuity-wizard close")
+      (wiz-btn :label "Finish" :kind "primary" :cmd "/usr/local/bin/continuity-wizard finish && /usr/local/bin/continuity-wizard close"))))

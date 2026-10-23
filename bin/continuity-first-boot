@@ -1,0 +1,187 @@
+#!/usr/bin/env bash
+# ContinuityOS — first-boot provisioning (system oneshot, runs once per machine).
+#
+# Driven by systemd/continuity-first-boot.service, which guards on
+# /var/lib/continuity/first-boot.done. Everything here is idempotent: a failed
+# run can safely be retried by deleting the marker and rebooting.
+#
+#   continuity-first-boot             provision
+#   continuity-first-boot --status    report what is provisioned
+#   continuity-first-boot --force     re-run even if the marker exists
+set -euo pipefail
+
+_lib="${CONTINUITY_LIB:-}"
+if [ -z "$_lib" ]; then
+  for _p in \
+    "$(cd "$(dirname "$0")" 2>/dev/null && pwd)/continuity-common.sh" \
+    "$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)/lib/continuity-common.sh" \
+    /usr/local/lib/continuity/continuity-common.sh \
+    /usr/lib/continuity/continuity-common.sh; do
+    [ -r "$_p" ] && { _lib="$_p"; break; }
+  done
+fi
+[ -r "${_lib:-}" ] || { echo "continuity-first-boot: cannot locate continuity-common.sh" >&2; exit 1; }
+# shellcheck source=../lib/continuity-common.sh
+. "$_lib"
+
+MARKER="/var/lib/continuity/first-boot.done"
+CONF="/etc/continuity/install.conf"
+SRC_DIR="${CONTINUITY_SOURCE_DIR:-/opt/continuityos}"
+FORCE=0
+STATUS_ONLY=0
+
+usage() {
+  cat <<'EOF'
+continuity-first-boot — provision a freshly installed ContinuityOS machine
+
+USAGE
+  continuity-first-boot [--status|--force] [--help]
+
+WHAT IT DOES (once per machine)
+  1. creates /var/lib/continuity and the system-level ContinuityOS directories
+  2. provisions every human user account from the source tree
+     (install.sh --user <name> --skip-packages)
+  3. prepares the first-run desktop environment and systemd state
+  4. enables the WinBoat bridge when winboat is installed
+  5. refreshes the desktop/mime databases
+  6. writes a welcome note to /etc/motd.d/continuity (seen on the first TTY login)
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --status) STATUS_ONLY=1; shift ;;
+    --force)  FORCE=1; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    *) continuity_die "unknown argument '$1' (see --help)" ;;
+  esac
+done
+
+if [ "$STATUS_ONLY" = "1" ]; then
+  if [ -e "$MARKER" ]; then
+    printf 'first boot: complete (%s)\n' "$(cat "$MARKER" 2>/dev/null || echo 'no detail')"
+  else
+    printf 'first boot: pending (marker %s is absent)\n' "$MARKER"
+  fi
+  [ -r "$CONF" ] && { printf 'install.conf:\n'; sed 's/^/  /' "$CONF"; }
+  printf 'source tree: %s (%s)\n' "$SRC_DIR" "$([ -r "$SRC_DIR/install.sh" ] && echo present || echo missing)"
+  exit 0
+fi
+
+if [ -e "$MARKER" ] && [ "$FORCE" != "1" ]; then
+  continuity_info "already provisioned ($MARKER); nothing to do"
+  exit 0
+fi
+
+if [ "$(id -u)" != "0" ]; then
+  continuity_die "first-boot provisioning must run as root (it writes /var/lib, /etc and user homes)"
+fi
+
+# --- 0. read the install state ------------------------------------------------
+if [ -r "$CONF" ]; then
+  # It is an EnvironmentFile, so it is safe to source (KEY=VALUE, no shell code
+  # is expected, but a stray line ending up here cannot escalate anything: we are
+  # root and this file is root-owned and 0644).
+  # shellcheck disable=SC1090
+  . "$CONF"
+  SRC_DIR="${CONTINUITY_SOURCE_DIR:-$SRC_DIR}"
+fi
+
+continuity_info "provisioning ${CONTINUITY_NAME} (source: $SRC_DIR)"
+
+# --- 1. directories -----------------------------------------------------------
+install -d -m 0755 /var/lib/continuity
+install -d -m 0755 /usr/share/continuity/config
+install -d -m 0755 /usr/share/backgrounds/continuity
+install -d -m 0755 /etc/continuity /etc/motd.d
+ok_count=0
+
+# --- 2. provision human users -------------------------------------------------
+# UID 1000+ with a real shell (login shells, not nologin/false).
+human_users() {
+  awk -F: '$3>=1000 && $3<65534 && $1!="nobody" {print $1":"$6":"$7}' /etc/passwd \
+    | while IFS=: read -r name home shell; do
+        case "$shell" in */nologin|*/false|"") continue ;; esac
+        [ -d "$home" ] || continue
+        printf '%s\n' "$name"
+      done
+}
+
+provisioned=()
+while IFS= read -r user; do
+  [ -n "$user" ] || continue
+  if [ -x "$SRC_DIR/install.sh" ]; then
+    continuity_info "provisioning user: $user"
+    if "$SRC_DIR/install.sh" --user "$user" --skip-packages --yes --src "$SRC_DIR" \
+        >/tmp/continuity-first-boot-$user.log 2>&1; then
+      provisioned+=("$user")
+    else
+      continuity_warn "user '$user' was not fully provisioned — see /tmp/continuity-first-boot-$user.log"
+    fi
+  else
+    # No source tree (a hand-built install without /opt/continuityos): copy the
+    # system-wide copy of the config tree that install.sh --system left behind.
+    continuity_warn "source tree missing at $SRC_DIR — seeding $user from /usr/share/continuity/config"
+    home="$(getent passwd "$user" | cut -d: -f6)"
+    if [ -d /usr/share/continuity/config ]; then
+      for rel in continuity hypr waybar eww rofi dunst gtk-3.0 gtk-4.0; do
+        [ -d "/usr/share/continuity/config/$rel" ] || continue
+        install -d -m 0755 "$home/.config/$rel"
+        cp -a "/usr/share/continuity/config/$rel/." "$home/.config/$rel/"
+      done
+      [ -r /usr/share/continuity/config/continuity/gtk.css ] && {
+        install -m 0644 /usr/share/continuity/config/continuity/gtk.css "$home/.config/gtk-3.0/gtk.css"
+        install -m 0644 /usr/share/continuity/config/continuity/gtk.css "$home/.config/gtk-4.0/gtk.css"
+      }
+      chown -R "$user:$user" "$home/.config/continuity" "$home/.config/hypr" "$home/.config/waybar" \
+        "$home/.config/eww" "$home/.config/rofi" "$home/.config/dunst" 2>/dev/null || true
+      provisioned+=("$user")
+    fi
+  fi
+done < <(human_users)
+
+if [ "${#provisioned[@]}" -gt 0 ]; then
+  continuity_ok "provisioned: ${provisioned[*]}"
+else
+  continuity_info "no user needed provisioning yet (new accounts inherit /etc/skel)"
+fi
+
+# --- 3. enable services -------------------------------------------------------
+if continuity_have systemctl; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+# --- 4. optional WinBoat bridge ----------------------------------------------
+if [ "${CONTINUITY_WITH_WINBOAT:-0}" = "1" ] && continuity_have winboat; then
+  systemctl enable continuity-winboat.service >/dev/null 2>&1 && \
+    continuity_ok "WinBoat bridge enabled (it needs: sudo pacman -S docker && sudo systemctl enable --now docker)" || true
+fi
+
+# --- 5. database refreshes ----------------------------------------------------
+continuity_have update-desktop-database && update-desktop-database -q /usr/share/applications 2>/dev/null || true
+continuity_have update-mime-database && update-mime-database /usr/share/mime 2>/dev/null || true
+continuity_have fc-cache && fc-cache -f >/dev/null 2>&1 || true
+
+# --- 6. motd ------------------------------------------------------------------
+cat >/etc/motd.d/continuity <<'EOF'
+
+  ContinuityOS — the Universal Windows Compatibility Engine
+  ---------------------------------------------------------
+  Boot             : this machine starts the desktop by itself, with no login
+                     prompt and no session menu (continuity-boot off undoes it)
+  Windows apps     : double-click any .exe, or  continuity-run <file.exe>
+  Quick settings   : Super+W        Gaming mode: Super+G
+  Prefixes         : continuity-prefix list
+  Will games run?  : continuity-shakedown
+  Engine health    : continuity-shakedown
+  Setup again      : continuity-wizard start --force
+  Documentation    : /usr/share/doc/continuity/ (docs/ in the source tree)
+
+EOF
+
+# --- done ---------------------------------------------------------------------
+printf '%s\n' "$(date -Is) provisioned by continuity-first-boot $CONTINUITY_VERSION (users: ${provisioned[*]:-none})" >"$MARKER"
+chmod 0644 "$MARKER"
+continuity_log "first-boot provisioning complete"
+continuity_ok "first boot complete — log out and back in (or reboot) to reach the desktop"
+exit 0

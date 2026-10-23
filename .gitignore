@@ -1,0 +1,14 @@
+# Build products and media — reproducible, large, and never part of the project.
+build/out/
+build/work/
+build/virtualbox-test/
+build/*.log
+*.iso
+
+# Machine-local junk that a Windows shell leaves behind.
+nul
+*.stackdump
+.tmp-*
+
+# Freebuff's per-project state (agent bookkeeping, not source).
+.freebuff/
