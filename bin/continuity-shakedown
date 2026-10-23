@@ -318,8 +318,8 @@ check_kernel() {
       record kernel PASS "$rel"
       ;;
     *)
-      record kernel WARN "$rel is not a -zen kernel" \
-        "sudo ./install.sh --system   (then pick 'Arch Linux (linux-zen)' in your bootloader and reboot)"
+      record kernel WARN "$rel is not a low-latency kernel" \
+        "$(continuity_pkg_command linux-zen 2>/dev/null || printf 'install linux-zen')   (then boot it from the bootloader)"
       ;;
   esac
   return 0
@@ -344,7 +344,7 @@ check_multilib() {
         record multilib PASS "the [multilib] repository is enabled"
       else
         record multilib FAIL "the [multilib] repository is disabled — no 32-bit package can be installed" \
-          "sudo ./install.sh --system"
+          "uncomment [multilib] in /etc/pacman.conf, then: sudo pacman -Sy"
       fi
       ;;
     debian)
@@ -612,7 +612,7 @@ check_governor() {
     *' performance '*) have_perf=1 ;;
   esac
   if [ "$gov" = "powersave" ] && [ "$have_perf" = "1" ]; then
-    record governor WARN "governor is powersave while performance is available" "continuity-gaming-mode on"
+    record governor WARN "governor is powersave while performance is available" "powerprofilesctl set performance"
     return 0
   fi
   if [ -z "$gov" ]; then

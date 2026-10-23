@@ -1,9 +1,0 @@
-[Desktop Entry]
-Type=Application
-Version=1.0
-Name=ContinuityOS
-Comment=ContinuityOS — Android-like Hyprland session with the Universal Windows Compatibility Engine
-Exec=/usr/local/bin/continuity-shell
-TryExec=/usr/local/bin/continuity-shell
-DesktopNames=Hyprland
-Icon=continuity-windows

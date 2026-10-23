@@ -289,7 +289,12 @@ case "$CMD" in
         while IFS= read -r rel; do
           [ -n "$rel" ] || continue
           base="${rel##*/}"; stem="${base%.*}"
-          icon="$CONTINUITY_ASSET_DIR/icons/windows-app.svg"
+          # A themed icon always exists; the shipped SVG is only used when this
+          # project installed its assets (a bare engine install does not).
+          icon="application-x-executable"
+          if [ -e "$CONTINUITY_ASSET_DIR/icons/windows-app.svg" ]; then
+            icon="$CONTINUITY_ASSET_DIR/icons/windows-app.svg"
+          fi
           if extracted="$(exe_icon "$(prefix_drive_c "$slug")/$rel" "$(continuity_slugify "$stem")" "$icon_root" 2>/dev/null)"; then
             icon="$extracted"
           fi

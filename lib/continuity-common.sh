@@ -47,14 +47,11 @@ continuity_paths() {
 
   CONTINUITY_CONFIG_DIR="${CONTINUITY_CONFIG_DIR:-$XDG_CONFIG_HOME/continuity}"
   CONTINUITY_PREFIX_ROOT="${CONTINUITY_PREFIX_ROOT:-$XDG_DATA_HOME/universal-prefixes}"
-  # Kept for the optional legacy continuity-umu-verify repair CLI only.
-  CONTINUITY_UMU_ROOT="${CONTINUITY_UMU_ROOT:-$XDG_DATA_HOME/umu}"
-  CONTINUITY_BUNDLED_RUNTIMES="${CONTINUITY_BUNDLED_RUNTIMES:-/usr/share/continuity/umu-runtimes}"
   CONTINUITY_LAUNCHER_DIR="${CONTINUITY_LAUNCHER_DIR:-$XDG_DATA_HOME/applications/continuity}"
   CONTINUITY_STATE_DIR="${CONTINUITY_STATE_DIR:-$XDG_STATE_HOME/continuity}"
   CONTINUITY_ASSET_DIR="${CONTINUITY_ASSET_DIR:-$XDG_DATA_HOME/continuity/assets}"
   CONTINUITY_LOG="${CONTINUITY_LOG:-$CONTINUITY_STATE_DIR/continuity.log}"
-  export CONTINUITY_CONFIG_DIR CONTINUITY_PREFIX_ROOT CONTINUITY_UMU_ROOT CONTINUITY_BUNDLED_RUNTIMES
+  export CONTINUITY_CONFIG_DIR CONTINUITY_PREFIX_ROOT
   export CONTINUITY_LAUNCHER_DIR CONTINUITY_STATE_DIR CONTINUITY_ASSET_DIR CONTINUITY_LOG
   return 0
 }
@@ -126,7 +123,7 @@ continuity_prefix_drive_c() {
 # Distribution family
 # ---------------------------------------------------------------------------
 # The engine is not Arch-only: it also runs from an ordinary user account on a
-# Debian/Ubuntu, Fedora or openSUSE install (see standalone/install.sh). Anything
+# Debian/Ubuntu, Fedora or openSUSE install (see install.sh). Anything
 # that prints a "how do I fix this" command asks here instead of hardcoding
 # pacman, so a hint is never a command that does not exist on the machine.
 continuity_family() {
@@ -192,6 +189,7 @@ continuity_pkg_name() {
     arch:gpu-driver-intel)  printf 'mesa linux-firmware' ;;
     arch:gl32)              printf 'lib32-libgl' ;;
     arch:wine)              printf 'wine' ;;
+    arch:linux-zen)         printf 'linux-zen' ;;
     arch:umu-launcher)      printf 'umu-launcher' ;;
     arch:winetricks)        printf 'winetricks' ;;
     arch:zstd)              printf 'zstd' ;;
@@ -284,7 +282,7 @@ continuity_umu_hint() {
     printf '%s' "$cmd"
     return 0
   fi
-  printf 'run this repository: standalone/install.sh --engine   (installs umu-run into your account)'
+  printf 're-run this project\047s install.sh   (it installs umu-run next to the command)'
 }
 
 # ---------------------------------------------------------------------------
@@ -305,25 +303,6 @@ continuity_refresh_desktop_db() {
     update-desktop-database "$CONTINUITY_LAUNCHER_DIR" >/dev/null 2>&1 || true
     update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
   fi
-}
-
-# ---------------------------------------------------------------------------
-# Hyprland / session helpers — every one of these degrades to a no-op so that
-# continuity-* tools also work from a TTY, SSH session, or non-Hyprland WM.
-# ---------------------------------------------------------------------------
-continuity_in_hyprland() {
-  [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] && continuity_have hyprctl
-}
-
-continuity_hypr() {
-  continuity_in_hyprland || return 0
-  hyprctl "$@" >/dev/null 2>&1 || true
-}
-
-continuity_hypr_keyword() { continuity_hypr keyword "$1" "${2:-}"; }
-
-continuity_session_running() {
-  [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]
 }
 
 # ---------------------------------------------------------------------------

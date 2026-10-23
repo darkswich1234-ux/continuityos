@@ -7,8 +7,9 @@
 #   ~/.local/share/universal-prefixes/<app-slug>/
 #
 # Proton and the Steam Linux Runtime are bootstrapped by umu-run, so nothing
-# here needs Steam, a custom distribution, a display manager or root. Install it
-# with standalone/install.sh; remove it with `proton uninstall`.
+# here needs Steam or a custom distribution. Install it with `sudo ./install.sh`
+# (every user) or `./install.sh` (this account); remove it with
+# `proton uninstall`.
 #
 #   proton setup.exe                 run in its own prefix
 #   proton --installer setup.exe     install, then register launchers
@@ -125,13 +126,13 @@ need() {
   fi
 }
 
-exec_run() { need RUN_BIN "continuity-run" "re-run standalone/install.sh"; exec "$RUN_BIN" "$@"; }
+exec_run() { need RUN_BIN "continuity-run" "re-run install.sh"; exec "$RUN_BIN" "$@"; }
 
 cmd_version() {
   continuity_load_env
   local umu
   umu="$(command -v umu-run 2>/dev/null || true)"
-  printf 'proton %s (ContinuityOS engine, standalone)\n' "$CONTINUITY_VERSION"
+  printf 'proton %s (ContinuityOS engine)\n' "$CONTINUITY_VERSION"
   printf 'continuity-run: %s\n' "${RUN_BIN:-missing}"
   printf 'umu-run:        %s\n' "${umu:-missing}"
   printf 'wine:           %s\n' "$(command -v wine 2>/dev/null || printf 'missing')"
@@ -155,7 +156,7 @@ cmd_uninstall() {
     continuity_die "cannot write to $SELF_DIR — re-run with: sudo $SELF uninstall $*"
   fi
 
-  # umu-run lives here too when standalone/install.sh downloaded it, and the
+  # umu-run lives here too when install.sh downloaded it, and the
   # directory is one this project manages, so it goes with the rest.
   local files=("$SELF_DIR/proton" "$SELF_DIR/continuity-run" \
                "$SELF_DIR/continuity-prefix" "$SELF_DIR/continuity-shakedown" \
@@ -184,6 +185,12 @@ cmd_uninstall() {
   local apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
   local mimeapps="${XDG_CONFIG_HOME:-$HOME/.config}/mimeapps.list"
   rm -f -- "$apps/continuity-wine.desktop"
+  # A root-level install put the handler under /usr/local, not in $HOME.
+  if [ -w /usr/local/share/applications ] && \
+     grep -q 'ContinuityOS' /usr/local/share/applications/continuity-wine.desktop 2>/dev/null; then
+    rm -f -- /usr/local/share/applications/continuity-wine.desktop
+    continuity_info "removed /usr/local/share/applications/continuity-wine.desktop"
+  fi
   if [ -r "$mimeapps" ]; then
     grep -v 'continuity-wine.desktop' "$mimeapps" >"$mimeapps.continuity-tmp" 2>/dev/null && \
       mv -- "$mimeapps.continuity-tmp" "$mimeapps"
@@ -235,14 +242,14 @@ case "$FIRST" in
     exec_run "$@"
     ;;
   list|info|path|root|scan|launchers|rm|remove|export|import|winetricks|protontricks|regedit|kill|browse|manage)
-    need PREFIX_BIN "continuity-prefix" "re-run standalone/install.sh"
+    need PREFIX_BIN "continuity-prefix" "re-run install.sh"
     SUB="$FIRST"
     [ "$SUB" = "remove" ] && SUB="rm"
     shift
     exec "$PREFIX_BIN" "$SUB" "$@"
     ;;
   check|doctor)
-    need CHECK_BIN "continuity-shakedown" "re-run standalone/install.sh"
+    need CHECK_BIN "continuity-shakedown" "re-run install.sh"
     shift
     exec "$CHECK_BIN" "$@"
     ;;
