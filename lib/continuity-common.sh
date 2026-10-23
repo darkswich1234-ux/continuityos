@@ -190,8 +190,11 @@ continuity_pkg_name() {
     arch:gl32)              printf 'lib32-libgl' ;;
     arch:wine)              printf 'wine' ;;
     arch:linux-zen)         printf 'linux-zen' ;;
-    arch:umu-launcher)      printf 'umu-launcher' ;;
+    # umu-launcher is deliberately absent: Arch ships it in the AUR only, so a
+    # `pacman -S umu-launcher` hint would fail. continuity_umu_hint falls back
+    # to the installer's own upstream download instead.
     arch:winetricks)        printf 'winetricks' ;;
+    arch:xdg-utils)         printf 'xdg-utils' ;;
     arch:zstd)              printf 'zstd' ;;
     arch:steam)             printf 'steam' ;;
     arch:gamescope)         printf 'gamescope' ;;
@@ -213,6 +216,7 @@ continuity_pkg_name() {
     debian:wine)            printf 'wine' ;;
     debian:wine32)          printf 'wine32:i386' ;;
     debian:winetricks)      printf 'winetricks' ;;
+    debian:xdg-utils)       printf 'xdg-utils' ;;
     debian:zstd)            printf 'zstd' ;;
     debian:gpu-driver-amd)  printf 'mesa-vulkan-drivers firmware-amd-graphics' ;;
     debian:gpu-driver-intel) printf 'mesa-vulkan-drivers firmware-misc-nonfree' ;;
@@ -234,12 +238,15 @@ continuity_pkg_name() {
     fedora:wine)            printf 'wine' ;;
     fedora:umu-launcher)    printf 'umu-launcher' ;;
     fedora:winetricks)      printf 'winetricks' ;;
+    fedora:xdg-utils)       printf 'xdg-utils' ;;
     fedora:zstd)            printf 'zstd' ;;
     fedora:gpu-driver-amd)  printf 'mesa-dri-drivers linux-firmware' ;;
     fedora:gpu-driver-intel) printf 'mesa-dri-drivers linux-firmware' ;;
     fedora:gamescope)       printf 'gamescope' ;;
     fedora:mangohud)        printf 'mangohud' ;;
     fedora:gamemode)        printf 'gamemode' ;;
+
+    suse:xdg-utils)         printf 'xdg-utils' ;;
   esac
   return 0
 }

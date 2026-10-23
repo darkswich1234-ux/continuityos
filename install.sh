@@ -179,6 +179,32 @@ resolve_paths() {
 # ---------------------------------------------------------------------------
 #  preflight
 # ---------------------------------------------------------------------------
+# Arch installs every 32-bit package from [multilib], which ships commented out in
+# /etc/pacman.conf. This script never edits that file — a bad edit breaks every
+# package operation on the machine — so it names the change instead. Without it
+# the install still succeeds, but 32-bit games cannot start and every lib32-*
+# remedy in `proton check` fails.
+arch_multilib_hint() {
+  local conf=/etc/pacman.conf line
+  [ -r "$conf" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "${line//[[:space:]]/}" in
+      '['multilib']') return 0 ;;
+    esac
+  done <"$conf"
+
+  warn "the [multilib] repository is disabled in $conf"
+  say "32-bit games and every lib32-* graphics package need it:"
+  if grep -qi '\[[[:space:]]*multilib[[:space:]]*\]' "$conf" 2>/dev/null; then
+    say "  uncomment [multilib] and its Include line, then: sudo pacman -Sy"
+  else
+    say "  add these two lines, then: sudo pacman -Sy"
+    say "    [multilib]"
+    say "    Include = /etc/pacman.d/mirrorlist"
+  fi
+  say "  the installer itself works either way"
+}
+
 preflight() {
   step "Preflight"
   continuity_have bash || die "bash is required"
@@ -203,6 +229,7 @@ preflight() {
   # shellcheck disable=SC1091
   pretty="$( . /etc/os-release 2>/dev/null; printf '%s' "${PRETTY_NAME:-unknown}" )"
   ok "distribution: $pretty ($(continuity_family))"
+  if [ "$(continuity_family)" = "arch" ]; then arch_multilib_hint; fi
   say "install target: $BIN_DIR"
 }
 
@@ -445,7 +472,7 @@ install_wine() {
 install_desktop() {
   [ "$DESKTOP" = "1" ] || return 0
   step "Windows .exe handler"
-  local file="$APP_DIR/continuity-wine.desktop" tmp t
+  local file="$APP_DIR/continuity-wine.desktop" tmp t fix
 
   if [ "$MODE" = "system" ]; then
     # A system-wide install must not rewrite the root user's MIME database.
@@ -474,6 +501,10 @@ install_desktop() {
     ok "double-clicking a .exe now opens it in Proton"
   else
     warn "xdg-mime is not installed; the handler exists but is not the default"
+    # Name the fix for this distribution: on Arch nothing installs xdg-utils by
+    # default, so a bare warning leaves double-click broken with no way forward.
+    fix="$(continuity_pkg_command xdg-utils 2>/dev/null || true)"
+    [ -n "$fix" ] && printf '  fix: %s   (then re-run this script)\n' "$fix" >&2
   fi
   continuity_have update-desktop-database && \
     run update-desktop-database "$APP_DIR" >/dev/null 2>&1 || true

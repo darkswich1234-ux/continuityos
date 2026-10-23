@@ -237,6 +237,27 @@ command_checks() {
     *) fail "proton check printed no report" ;;
   esac
 
+  group "proton · Arch-derived advice"
+  # The suite itself runs on any family, so Arch is exercised through the
+  # library's own override. Each assertion is a command that would have failed
+  # on Arch: a wine32 package that does not exist, an umu-launcher that only
+  # lives in the AUR, and a double-click fix with no remedy at all.
+  local alib="$home/.local/lib/continuity/continuity-common.sh"
+  out="$(CONTINUITY_FAMILY=arch CONTINUITY_LIB="$alib" bash -c '. "$CONTINUITY_LIB"; continuity_pkg_command wine wine32' 2>&1)"
+  [ "$out" = "sudo pacman -S wine" ] && pass "Wine is installed with pacman, without a nonexistent wine32" \
+    || fail "unexpected Arch Wine command: $out"
+  out="$(CONTINUITY_FAMILY=arch CONTINUITY_LIB="$alib" bash -c '. "$CONTINUITY_LIB"; continuity_umu_hint' 2>&1)"
+  case "$out" in
+    *"pacman -S umu-launcher"*) fail "an Arch host is told to install umu-launcher from pacman (AUR only)" ;;
+    *) pass "the umu hint never names a package Arch does not ship" ;;
+  esac
+  out="$(CONTINUITY_FAMILY=arch CONTINUITY_LIB="$alib" bash -c '. "$CONTINUITY_LIB"; continuity_pkg_command xdg-utils' 2>&1)"
+  [ "$out" = "sudo pacman -S xdg-utils" ] && pass "the double-click dependency has an Arch remedy" \
+    || fail "no Arch remedy for xdg-utils: $out"
+  out="$(CONTINUITY_FAMILY=arch CONTINUITY_LIB="$alib" bash -c '. "$CONTINUITY_LIB"; continuity_pkg_command vulkan-amd32' 2>&1)"
+  [ "$out" = "sudo pacman -S lib32-vulkan-radeon" ] && pass "the 32-bit GPU packages are the lib32-* ones" \
+    || fail "unexpected 32-bit GPU command: $out"
+
   group "proton · uninstall"
   mkdir -p "$home/.local/share/universal-prefixes/keepme/drive_c"
   "${envp[@]}" proton uninstall --yes >/dev/null 2>&1; rc=$?

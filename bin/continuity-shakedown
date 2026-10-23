@@ -304,7 +304,7 @@ scan_cards() {
 
 # --- checks -------------------------------------------------------------------
 check_kernel() {
-  local rel fam
+  local rel fam virt=""
   rel="$(uname -r 2>/dev/null || printf 'unknown')"
   fam="$(continuity_family)"
   if [ "$fam" != "arch" ]; then
@@ -313,6 +313,17 @@ check_kernel() {
     record kernel SKIP "$rel ($fam — the linux-zen preference is Arch-specific)"
     return 0
   fi
+  # WSL and containers run the host's kernel: installing linux-zen inside one
+  # changes nothing that boots, so the suggestion would be pure noise.
+  if continuity_have systemd-detect-virt; then
+    virt="$(systemd-detect-virt 2>/dev/null || true)"
+  fi
+  case "$virt" in
+    wsl|docker|podman|lxc|lxc-libvirt|systemd-nspawn|openvz|proot)
+      record kernel SKIP "$rel (running in $virt — the kernel belongs to the host)"
+      return 0
+      ;;
+  esac
   case "$rel" in
     *-zen*)
       record kernel PASS "$rel"

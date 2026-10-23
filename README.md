@@ -59,6 +59,8 @@ A prefix is just a directory, so one broken game only ruins its own:
 
 - x86_64 Linux with a working desktop and Vulkan driver.
 - `python3`, `tar`, and `curl` or `wget` (`--with-deps` installs what is missing).
+- `xdg-utils` for double-clicking `.exe` files; without it the handler is installed
+  but is not the default, and the installer prints the command for your distribution.
 - Network on the first launch, for the Proton build and the Steam Linux Runtime.
 - Wine is optional: needed for `.msi`, `.lnk` and `proton --native`.
 - 32-bit games need the distribution's i386 stack — `proton check --fix` prints the
@@ -68,10 +70,14 @@ A prefix is just a directory, so one broken game only ruins its own:
 
 | Family | Engine install | 32-bit for older games |
 |---|---|---|
+| Arch / CachyOS / end4-pc | root or user install; `umu-run` zipapp from upstream (Arch ships `umu-launcher` in the AUR only, not in the official repositories); Wine from `extra` | enable `[multilib]` in `/etc/pacman.conf`, then the `lib32-*` driver packages |
 | Debian / Ubuntu / infinityOS | user or root install; `umu-run` zipapp from upstream (no repository package exists) | `sudo dpkg --add-architecture i386`, then the `:i386` graphics drivers |
 | Fedora / Nobara | `umu-launcher` from the repository where it exists, otherwise the zipapp | the `.i686` driver packages |
-| Arch / CachyOS | `umu-launcher` from `[multilib]` where installed, otherwise the zipapp | the `lib32-*` packages |
 | openSUSE / other | zipapp, with a warning naming what to install | depends on the vendor repository |
+
+On Arch the installer does not edit `/etc/pacman.conf`. If `[multilib]` is still
+commented out it says so, with the two lines to uncomment; the install itself
+works either way, but 32-bit games cannot start until it is enabled.
 
 Everything that prints a remedy (`proton check`, a missing `umu-run`, a missing
 Wine) uses the local distribution's package manager instead of assuming `pacman`.
@@ -95,7 +101,8 @@ tests/run.sh               offline checks; run them after any change
 
 The installer, the command, prefix management and the readiness report are covered
 by `tests/run.sh` (offline, no root, no network) and were exercised end to end on a
-Debian-family system: install, re-install, `proton` commands, uninstall, root-level
-install, CRLF checkouts and refusing to overwrite files it did not create. A real
-Proton launch is the one thing that cannot be proven off the target machine — it
-needs the GPU and the first-launch runtime download.
+Debian-family system and on Arch Linux: install, re-install, `proton` commands,
+`proton check`, uninstall, root-level install, CRLF checkouts and refusing to
+overwrite files it did not create. A real Proton launch is the one thing that cannot
+be proven off the target machine — it needs the GPU and the first-launch runtime
+download.

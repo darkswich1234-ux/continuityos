@@ -77,17 +77,32 @@ and build their advice from that:
 | Arch / CachyOS | `pacman` | `[multilib]` must be enabled; `lib32-*` packages |
 | openSUSE | `zypper` | vendor repositories |
 
+Arch details worth knowing:
+
+- The installer never edits `/etc/pacman.conf`. If `[multilib]` is commented out it
+  prints the two lines to uncomment and carries on; without it every `lib32-*`
+  command from `proton check` will fail with "target not found".
+- `wine` comes from `extra` and works without `[multilib]`, so `.msi`, `.lnk` and
+  `--native` are available on a stock Arch install.
+- `xdg-utils` (for `xdg-mime`) is not part of a base Arch install. Without it the
+  `.exe` handler is registered but never becomes the default; `install.sh` prints
+  `sudo pacman -S xdg-utils` and re-running it completes the association.
+- `umu-launcher` is AUR-only, so no remedy ever suggests `pacman -S umu-launcher`;
+  the installer's own verified upstream download is the supported route.
+
 `proton check` reports the 32-bit stack separately because a 64-bit game can run
 perfectly while every 32-bit one fails with an error that names none of this.
 
 ## Why the installer downloads umu-run
 
-`umu-launcher` is packaged by Arch and Nobara, but not by Debian, Ubuntu or
-Fedora, so the installer uses the route upstream documents for generic
-distributions: the zipapp from the latest GitHub release. It reads the release
-metadata, installs the archive's `umu-run` next to the other commands, and
-**verifies the published SHA-256** before installing it. `--engine /path/to/umu-run`
-uses an existing one instead, and `--no-download` skips the step entirely.
+`umu-launcher` is packaged by Nobara, but not by Debian, Ubuntu, Fedora or Arch's
+official repositories (Arch keeps it in the AUR), so the installer uses the route
+upstream documents for generic distributions: the zipapp from the latest GitHub
+release. It reads the release metadata, installs the archive's `umu-run` next to
+the other commands, and **verifies the published SHA-256** before installing it.
+`--engine /path/to/umu-run` uses an existing one instead, and `--no-download` skips
+the step entirely. Because the zipapp is a Python program, `python3` is a
+prerequisite on every distribution, Arch included.
 
 ## Uninstall
 
@@ -115,4 +130,5 @@ deleted.
 - **A game breaks after an update** — `proton rm <slug>` and install it into a
   fresh prefix; the rest of your prefixes are untouched.
 - **The desktop opens the wrong application for `.exe`** — `xdg-mime` was missing
-  at install time. Install `xdg-utils` and re-run `install.sh`.
+  at install time. Install `xdg-utils` (`sudo pacman -S xdg-utils` on Arch,
+  `sudo apt install xdg-utils` on Debian/Ubuntu) and re-run `install.sh`.
